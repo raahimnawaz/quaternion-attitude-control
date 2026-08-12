@@ -1,27 +1,8 @@
 #include <Wire.h>
 #include <math.h>
+#include "quat.h"
 
-struct Quat { float w, x, y, z; };
 struct Vec3 { float x, y, z; };
-
-Quat quat_mul(const Quat& q, const Quat& p) {
-  return {
-    q.w*p.w - q.x*p.x - q.y*p.y - q.z*p.z,
-    q.w*p.x + q.x*p.w + q.y*p.z - q.z*p.y,
-    q.w*p.y - q.x*p.z + q.y*p.w + q.z*p.x,
-    q.w*p.z + q.x*p.y - q.y*p.x + q.z*p.w
-  };
-}
-
-Quat quat_conj(const Quat& q) {
-  return { q.w, -q.x, -q.y, -q.z };
-}
-
-Quat quat_from_axis_angle(float ax, float ay, float az, float rad) {
-  float half_angle = rad / 2.0f;
-  float s = sin(half_angle);
-  return { cos(half_angle), ax * s, ay * s, az * s };
-}
 
 // Controller Tuning (J = [1, 2, 3])
 // Tuned for wn = 3.0 rad/s, zeta = 0.7
@@ -32,11 +13,21 @@ Quat q_cmd;
 
 void setup() {
   Serial.begin(115200);
+
+  // M2 gate. Runs before the bus is touched so a broken quaternion library
+  // cannot be mistaken for a broken plant or a broken controller.
+  if (quat_selftest()) {
+    Serial.println(F("ALL TESTS PASS"));
+  } else {
+    Serial.println(F("SELFTEST FAILED"));
+    while (1) { }  // refuse to close the loop on top of bad math
+  }
+
   Wire.begin();
   Wire.setClock(400000); // 400kHz I2C
-  
+
   delay(100); // Let custom chip boot
-  
+
   // Command a 90-degree step rotation about the X-axis
   q_cmd = quat_from_axis_angle(1.0f, 0.0f, 0.0f, PI / 2.0f);
   
