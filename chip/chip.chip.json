@@ -1,0 +1,6 @@
+{
+  "name": "chip",
+  "author": "Raahim Nawaz",
+  "pins": [ "GND", "VCC", "SDA", "SCL" ],
+  "controls": []
+}

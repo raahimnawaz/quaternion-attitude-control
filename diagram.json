@@ -3,33 +3,50 @@
   "author": "Raahim Nawaz",
   "editor": "wokwi",
   "parts": [
-    { "type": "wokwi-breadboard", "id": "bb1", "top": -348.6, "left": -208.4, "attrs": {} },
-    { "type": "wokwi-arduino-mega", "id": "mega", "top": 29.4, "left": -99.6, "attrs": {} },
-    { "type": "chip-rigid-body", "id": "plant", "top": -67.2, "left": 67.2, "attrs": {} },
-    { "type": "board-ssd1306", "id": "oled", "top": -150, "left": -250, "attrs": { "i2cAddress": "0x3c" } },
-    { "type": "wokwi-analog-joystick", "id": "joy", "top": 250, "left": -350, "attrs": {} },
-    { "type": "wokwi-potentiometer", "id": "pot", "top": 450, "left": -350, "attrs": {} }
+    { "type": "wokwi-arduino-mega", "id": "mega", "top": 0, "left": 0, "attrs": {} },
+    { "type": "chip-chip", "id": "chip2", "top": -142.98, "left": 187.2, "attrs": {} },
+    {
+      "type": "board-ssd1306",
+      "id": "oled",
+      "top": -150.46,
+      "left": -249.37,
+      "rotate": 180,
+      "attrs": { "i2cAddress": "0x3c" }
+    },
+    {
+      "type": "wokwi-analog-joystick",
+      "id": "joy",
+      "top": 249,
+      "left": -349.8,
+      "rotate": 180,
+      "attrs": {}
+    },
+    {
+      "type": "wokwi-potentiometer",
+      "id": "pot",
+      "top": 440.3,
+      "left": -557,
+      "rotate": 180,
+      "attrs": {}
+    }
   ],
   "connections": [
-    [ "mega:20", "plant:SDA", "green", [ "v0" ] ],
-    [ "mega:21", "plant:SCL", "blue", [ "v0" ] ],
-    [ "mega:5V", "plant:VCC", "red", [ "v0" ] ],
-    [ "mega:GND.1", "plant:GND", "black", [ "v0" ] ],
-
-    [ "mega:20", "oled:SDA", "green", [ "v0" ] ],
-    [ "mega:21", "oled:SCL", "blue", [ "v0" ] ],
-    [ "mega:5V", "oled:VCC", "red", [ "v0" ] ],
-    [ "mega:GND.1", "oled:GND", "black", [ "v0" ] ],
-
-    [ "mega:A0", "joy:HORZ", "yellow", [ "v0" ] ],
-    [ "mega:A1", "joy:VERT", "orange", [ "v0" ] ],
-    [ "mega:2", "joy:SEL", "purple", [ "v0" ] ],
-    [ "mega:5V", "joy:VCC", "red", [ "v0" ] ],
-    [ "mega:GND.2", "joy:GND", "black", [ "v0" ] ],
-
-    [ "mega:A2", "pot:SIG", "cyan", [ "v0" ] ],
-    [ "mega:5V", "pot:VCC", "red", [ "v0" ] ],
-    [ "mega:GND.2", "pot:GND", "black", [ "v0" ] ]
+    [ "chip2:SDA", "mega:20", "green", [ "v0" ] ],
+    [ "chip2:SCL", "mega:21", "blue", [ "v0" ] ],
+    [ "chip2:VCC", "mega:5V", "red", [ "v0" ] ],
+    [ "chip2:GND", "mega:GND.1", "black", [ "v0" ] ],
+    [ "oled:SDA", "mega:20", "green", [ "v0" ] ],
+    [ "oled:SCL", "mega:21", "blue", [ "v0" ] ],
+    [ "oled:VCC", "mega:5V", "red", [ "v0" ] ],
+    [ "oled:GND", "mega:GND.1", "black", [ "v0" ] ],
+    [ "joy:HORZ", "mega:A0", "yellow", [ "v0" ] ],
+    [ "joy:VERT", "mega:A1", "orange", [ "v0" ] ],
+    [ "joy:SEL", "mega:2", "purple", [ "v0" ] ],
+    [ "joy:VCC", "mega:5V", "red", [ "v0" ] ],
+    [ "joy:GND", "mega:GND.2", "black", [ "v0" ] ],
+    [ "pot:SIG", "mega:A2", "cyan", [ "v0" ] ],
+    [ "pot:VCC", "mega:5V", "red", [ "v0" ] ],
+    [ "pot:GND", "mega:GND.2", "black", [ "v0" ] ]
   ],
   "dependencies": {}
 }
