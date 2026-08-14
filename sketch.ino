@@ -1,7 +1,13 @@
-#include <Wire.h>
-#include <math.h>
+#include "Wire.h"
+#include "math.h"
+#include "Adafruit_GFX.h"
+#include "Adafruit_SSD1306.h"
 
-// Toggle this! 1 = Naive Controller (Bugged). 0 = Optimized Controller (Fixed).
+#define SCREEN_WIDTH 128
+#define SCREEN_HEIGHT 64
+#define OLED_RESET -1
+Adafruit_SSD1306 display(SCREEN_WIDTH, SCREEN_HEIGHT, &Wire, OLED_RESET);
+
 #define UNWINDING_DEMO 0 
 
 struct Quat { float w, x, y, z; };
@@ -20,12 +26,6 @@ Quat quat_conj(const Quat& q) {
   return { q.w, -q.x, -q.y, -q.z };
 }
 
-Quat quat_from_axis_angle(float ax, float ay, float az, float rad) {
-  float half_angle = rad / 2.0f;
-  float s = sin(half_angle);
-  return { cos(half_angle), ax * s, ay * s, az * s };
-}
-
 const float Kp[3] = {18.0f, 36.0f, 54.0f}; 
 const float Kd[3] = {4.2f,  8.4f,  12.6f}; 
 
@@ -35,12 +35,19 @@ void setup() {
   Serial.begin(115200);
   Wire.begin();
   Wire.setClock(400000); 
+  
+  // Initialize the OLED
+  if(!display.begin(SSD1306_SWITCHCAPVCC, 0x3C)) {
+    Serial.println(F("SSD1306 allocation failed"));
+    for(;;);
+  }
+  display.clearDisplay();
+  display.display();
+  
   delay(100); 
   
-  // Command exactly 181 degrees (Just past the halfway point of the sphere)
-  q_cmd = quat_from_axis_angle(1.0f, 0.0f, 0.0f, 181.0f * PI / 180.0f);
-  
-  Serial.println("t_ms,qw,qx,qy,qz,err_deg,wx,wy,wz,tx,ty,tz,loop_us");
+  // Command Level Flight
+  q_cmd = {1.0f, 0.0f, 0.0f, 0.0f};
 }
 
 void loop() {
@@ -58,22 +65,7 @@ void loop() {
   Quat q_est_inv = quat_conj(q_est);
   Quat q_err = quat_mul(q_est_inv, q_cmd);
 
-  // --- THE UNWINDING LOGIC ---
-  #if UNWINDING_DEMO
-    // The Bug: The controller is blind to the shortest path.
-    float sign_w = 1.0f; 
-  #else
-    // The Fix: Check if we are on the wrong hemisphere.
-    float sign_w = (q_err.w >= 0.0f) ? 1.0f : -1.0f; 
-  #endif
-
-  // Calculate the physical error angle strictly for the plotter display
-  float err_deg;
-  if (sign_w < 0.0f) {
-    err_deg = 2.0f * acos(max(-1.0f, min(1.0f, -q_err.w))) * (180.0f / PI);
-  } else {
-    err_deg = 2.0f * acos(max(-1.0f, min(1.0f, q_err.w))) * (180.0f / PI);
-  }
+  float sign_w = (q_err.w >= 0.0f) ? 1.0f : -1.0f; 
 
   Vec3 tau;
   tau.x = Kp[0] * sign_w * q_err.x - Kd[0] * w.x;
@@ -85,22 +77,35 @@ void loop() {
   Wire.write((uint8_t*)&tau, 12);
   Wire.endTransmission();
 
+  // --- M5: OLED ARTIFICIAL HORIZON ---
+  
+  // 1. Convert Quaternion to Euler (Roll and Pitch)
+  float roll  = atan2(2.0f * (q_est.w * q_est.x + q_est.y * q_est.z), 1.0f - 2.0f * (q_est.x * q_est.x + q_est.y * q_est.y));
+  float pitch = asin(2.0f * (q_est.w * q_est.y - q_est.z * q_est.x));
+
+  display.clearDisplay();
+
+  // 2. Draw the static aircraft reticle in the center
+  display.drawFastHLine(64 - 15, 32, 10, SSD1306_WHITE); // Left wing
+  display.drawFastHLine(64 + 5,  32, 10, SSD1306_WHITE); // Right wing
+  display.drawPixel(64, 32, SSD1306_WHITE);              // Nose
+
+  // 3. Calculate the moving horizon line
+  float pixels_per_rad = 40.0f; 
+  float pitch_offset = pitch * pixels_per_rad;
+  
+  int r = 100; // Length of the horizon line
+  int x0 = 64 - r * cos(roll);
+  int y0 = 32 + pitch_offset + r * sin(roll);
+  int x1 = 64 + r * cos(roll);
+  int y1 = 32 + pitch_offset - r * sin(roll);
+
+  display.drawLine(x0, y0, x1, y1, SSD1306_WHITE);
+  display.display();
+
+  // -----------------------------------
+
   uint32_t loop_us = micros() - t_start;
-
-  Serial.print(millis()); Serial.print(",");
-  Serial.print(q_est.w, 3); Serial.print(",");
-  Serial.print(q_est.x, 3); Serial.print(",");
-  Serial.print(q_est.y, 3); Serial.print(",");
-  Serial.print(q_est.z, 3); Serial.print(",");
-  Serial.print(err_deg, 2); Serial.print(",");
-  Serial.print(w.x, 2); Serial.print(",");
-  Serial.print(w.y, 2); Serial.print(",");
-  Serial.print(w.z, 2); Serial.print(",");
-  Serial.print(tau.x, 2); Serial.print(",");
-  Serial.print(tau.y, 2); Serial.print(",");
-  Serial.print(tau.z, 2); Serial.print(",");
-  Serial.println(loop_us);
-
   int delay_time = 10 - (loop_us / 1000);
   if (delay_time > 0) delay(delay_time);
 }
