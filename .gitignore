@@ -1,0 +1,11 @@
+# KiCad per-user local state — not part of the design
+*.kicad_prl
+fp-info-cache
+*-backups/
+*.kicad_sch-bak
+*.kicad_pcb-bak
+_autosave-*
+
+# KiCad build output
+*.net
+gerbers/

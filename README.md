@@ -110,25 +110,47 @@ An STM32WBA55HEFx (Cortex-M33 + FPU, integrated radio) on 3V3 from an AMS1117
 LDO, with the joystick on `PA0`/`PA1`, the gain potentiometer on `PA2`, SWD on
 J1, and 4.7 kΩ I²C pull-ups to an off-board IMU on J3.
 
-**v1 is a schematic, not a verified design.** Reviewing the sheet, before
-anything gets fabricated:
+**v1 is a schematic, and it should not be fabricated as drawn.** The whole
+design is 11 components. Tracing the netlist out of the `.kicad_sch` rather than
+eyeballing the sheet, in severity order:
 
-- **Decoupling.** The eight supply pins (`VDDA`, `VDD`×3, `VDDSMPS`, `VDDRF`,
-  `VDDRFPA`, `VDDANA`, `VDD11`) are tied to one net, and the only capacitors on
-  the sheet are `C2` (10 µF, regulator input) and `C1` (0.1 µF, output). This
-  part wants ~100 nF per supply pin plus local bulk. Most likely cause of a
-  dead first article.
-- **`NRST` is floating.** It wants the usual 100 nF to ground.
-- **No crystal.** `OSC_IN`/`OSC_OUT` are marked no-connect, so this runs on the
-  internal RC — which rules out the radio that is the reason to pick a WBA55 in
-  the first place. Either add the 32 MHz crystal or drop to a cheaper part.
-- **`VLXSMPS` is no-connect.** The WBA55's internal SMPS needs its inductor to
-  `VDDSMPS`, or the part needs to be configured for LDO mode and tied off per
-  the datasheet. As drawn it is neither.
-- **LDO output cap is light.** The AMS1117 wants ≥10 µF (22 µF tantalum is the
-  datasheet suggestion) for loop stability; 0.1 µF alone is marginal.
-- **Title block still says "mini inverter"** — template leftover from another
-  project.
+1. **`VDD11` is tied to +3V3.** Every supply pin — `VDD`, `VDDA`, `VDDANA`,
+   `VDDHPA`, `VDDRF`, `VDDRFPA`, `VDDSMPS` **and `VDD11`** — sits on one net.
+   `VDD11` is the 1.1 V core/radio domain, not a supply input. Driving 3.3 V
+   into it is a part-killer, and it is consistent with the next item: the SMPS
+   that is supposed to *produce* that rail has been no-connected instead.
+2. **`VLXSMPS` is no-connect.** The internal SMPS needs its inductor between
+   `VLXSMPS` and `VDD11`, or the part must be strapped for LDO mode per the
+   datasheet's power-supply scheme. As drawn it is neither, which is how 1
+   happened. **Fix these two together — read the datasheet's supply table and
+   redraw the power section from it.**
+3. **The package is `ST_WLCSP-41_2.98x2.76mm_P0.4mm_Stagger`.** A 41-ball
+   wafer-level chip-scale part on 0.4 mm staggered pitch: bare die, no leads.
+   That needs HDI with via-in-pad and laser microvias, a stencil and reflow, and
+   it cannot be hand-soldered, reworked, or probed. It is also light-sensitive.
+   The QFN version of the same silicon is routable on two layers and solderable
+   with an iron. Unless there is a size constraint that justifies it, **this one
+   choice is what makes the board unbuildable at hobby scale.**
+4. **Decoupling is one capacitor.** `C1` (0.1 µF) and `C2` (10 µF) are the only
+   caps on the sheet, both at the regulator. Eight supply pins want ~100 nF each
+   placed at the ball, plus bulk. On a normal package this is the single most
+   common reason a first article is dead on arrival.
+5. **No crystal.** `OSC_IN`/`OSC_OUT` are no-connect, so this runs on the
+   internal RC — which rules out the radio that is the reason to choose a WBA55.
+   Either add the 32 MHz crystal or drop to a cheaper, non-wireless part.
+6. **`NRST` floats.** It wants the usual 100 nF to ground.
+7. **LDO output cap is light.** The AMS1117 wants ≥10 µF (the datasheet suggests
+   22 µF tantalum) to stay stable; 0.1 µF alone is marginal.
+8. **The project's root sheet is empty.** `hardware/quat_project.kicad_sch` is a
+   blank A4 page, and the real design lives in
+   `quat_project_pcb_v1_sch.kicad_sch`, which nothing references — so opening the
+   project shows nothing. Every symbol's instance path is also still bound to
+   `(project "mini inverter")`, and the title block says the same. The design was
+   started by copying another project and never rebound.
+
+**There is no layout.** `hardware/quat_project.kicad_pcb` is an empty board file
+— no stackup, no footprints, no traces. Footprints *are* assigned to all 11
+symbols, so the netlist would import; nothing has been placed or routed.
 
 ---
 
@@ -143,10 +165,12 @@ anything gets fabricated:
 | M5 | OLED artificial horizon, decoupled from the control loop | ✅ |
 | M7 | Mahony fusion + joystick/potentiometer input | ✅ |
 | M8 | `invSqrt` | ⚠️ now target-conditional, **cost still unmeasured** — §3 |
-| — | Custom PCB v1 schematic | ⚠️ drawn, **not reviewed-clean, not fabricated** — see above |
+| — | Custom PCB v1 schematic | ⛔ drawn, **8 defects, do not fabricate** — see above |
+| — | PCB layout | ⬜ empty board file, nothing placed |
 
 **Next, in order:** re-run M4 at 359°; benchmark `invSqrt` on Mega and ESP32;
-fix the six schematic items before ordering.
+redraw the board's power section from the datasheet supply table and move off
+the WLCSP before laying anything out.
 
 ## Running it
 
@@ -157,6 +181,7 @@ in `libraries.txt`. The board is `wokwi-arduino-mega`.
 sketch.ino          flight code: Mahony fusion, quaternion PD, OLED, pilot input
 chip/chip.chip.c    the plant — RK4 Euler's equations, I²C fake IMU at 0x42
 diagram.json        Mega + custom chip + SSD1306 + joystick + potentiometer
-docs/schematic.png  custom STM32WBA55 board, v1
+hardware/           KiCad 10 project for the custom board (see the board section)
+docs/schematic.png  rendered v1 sheet
 *.csv, *.svg        M4 run data — read §1 before citing these
 ```
