@@ -1,32 +1,162 @@
-# Quaternion Attitude Control (`quat_project`)
+# quat_project — quaternion attitude estimation and control
 
-## Overview
-This repository contains the firmware, schematics, and validation data for a quaternion-based attitude estimation and control system. Built primarily in C/C++ for embedded systems, it leverages sensor fusion, hardware-level algorithm optimizations, and includes a custom PCB design.
+A quaternion attitude estimator and PD controller for a free-floating rigid
+body, running on an **ATmega2560** against a physics plant simulated as a
+custom Wokwi chip — plus a custom **STM32WBA55** board to move it onto.
 
-## Key Features
-* **Sensor Fusion:** Implements a Mahony filter for accurate attitude estimation.
-* **Hardware Optimization:** Utilizes the Quake III fast inverse square root algorithm to maximize performance on resource-constrained hardware.
-* **Custom Hardware:** Includes a complete KiCad schematic (`quat_project_pcb_v1_sch.kicad_sch`) for custom PCB deployment.
-* **Physical Control Interface:** Integrates potentiometer and joystick inputs for real-time control.
-* **Controller Optimization & Validation:** Compares naive vs. optimized controller performance, backed by CSV datasets and SVG visualizations.
+The plant is not a stub. `chip/chip.chip.c` integrates Euler's rigid-body
+equations with **RK4** on an asymmetric inertia tensor, propagates the attitude
+quaternion by **exponential map** (with a small-angle branch below θ = 1e-8 to
+avoid `sin(θ)/θ` blowing up), and exposes itself over I²C at `0x42` as a fake
+IMU — accelerometer and gyro registers out, torque registers in, with
+high-frequency noise injected on the accelerometer. The firmware sees a sensor,
+not a truth feed.
 
-## Repository Structure
-* **`sketch.ino`**: Main application entry point for the microcontroller.
-* **`chip/`**: Contains the core Mahony filter implementation and physical control logic.
-* **`rigid-body.chip.c` / `rigid-body.chip.json`**: Rigid body logic and diagram configurations.
-* **`quat_project_pcb_v1_sch.kicad_sch`**: KiCad schematic file for the custom printed circuit board.
-* **Data & Charts (`*.csv`, `*.svg`)**: Performance validation datasets (naive vs. optimized) and graphical plots tracking Error (degrees) over time and Quaternions over time.
-* **`quaternion-attitude-blueprint.md`**: Detailed build blueprint and architectural documentation.
-
-## Tech Stack
-* **Languages:** C, C++
-* **Tools:** KiCad
-* **Domains:** Aerospace, Embedded Systems, Firmware, Sensor Fusion
-
-## Getting Started
-1. **Firmware:** Open `sketch.ino` in your preferred IDE (e.g., Arduino IDE, PlatformIO) and flash it to your target microcontroller.
-2. **Hardware:** Open `quat_project_pcb_v1_sch.kicad_sch` using KiCad to view or modify the custom PCB schematic.
-3. **Documentation:** Refer to `quaternion-attitude-blueprint.md` for detailed build instructions and system architecture.
+```
+ chip.chip.c (plant)          sketch.ino (flight code)
+ ─────────────────────        ────────────────────────────────────────────
+ RK4 · Euler's equations      Mahony fusion → quaternion PD → torque out
+ exponential-map quaternion   OLED artificial horizon, decoupled at 30 FPS
+ noisy accel + gyro    ──I²C──▶  joystick commands attitude, pot scales gain
+```
 
 ---
-*Developed by [Raahim Nawaz](https://github.com/raahimnawaz)*
+
+## The honest part
+
+### 1. The naive-vs-optimised comparison does not show what it was built to show
+
+The intent was to demonstrate **quaternion unwinding** — a controller that uses
+the raw error quaternion without sign correction takes the long way around the
+sphere. Commanding 181° and toggling `UNWINDING_DEMO` is exactly the right shape
+of experiment, and the sign fix (`sign_w` in `sketch.ino`) is the correct
+remedy.
+
+But the two runs in `naive_results.csv` and `optimized_result.csv` are the same
+convergence curve:
+
+| t (ms) | naive err° | optimised err° |
+|---:|---:|---:|
+| 102 | 180.91 | 179.09 |
+| 1000 | 55.94 | 57.12 |
+| 1500 | 16.82 | 16.73 |
+| 2000 | 6.51 | 6.37 |
+| 2500 | 2.29 | 2.28 |
+| 2736 | 1.24 | 1.24 |
+
+First crossing of 10° / 5° / 2°: **1755 / 2148 / 2567 ms** naive versus
+**1742 / 2153 / 2563 ms** optimised. Integrating ‖ω‖ over each run, the total
+angular path travelled is **236.7°** naive versus **237.0°** optimised. Neither
+run's error ever exceeds its starting value, so **neither controller unwound.**
+
+Two reasons:
+
+- **The test point is too close to the boundary.** At a 181° command the long
+  way is 181° and the short way is 179°. The 2° difference is inside the noise.
+  Unwinding is dramatic near **359°**, where the naive law travels almost a full
+  revolution and the corrected one travels ~1°. That is the command to use.
+- **The runs are different lengths.** Naive was stopped at 2.7 s, optimised ran
+  to 5.7 s. The headline "2.54° → 0.00°" is therefore **run length, not
+  control** — the naive run was simply never given the extra three seconds in
+  which the other one finished settling.
+
+The initial torques do differ in sign (`tx` = +17.40 naive, −17.48 optimised),
+so the sign logic is live and the two controllers really do pick opposite
+rotation directions. There is just nothing to see at 181°.
+
+**Status: the experiment is designed correctly and has not yet produced a
+result. Re-run both branches at a 359° command, for the same duration.**
+
+### 2. The recorded data predates the code it appears to validate
+
+Both CSVs were written in a single commit, `a5871e4` ("added optimized
+controller"). `invSqrt` was introduced two commits later in `4b8ad59`. **Nothing
+in this repository measures the cost of `invSqrt`**, and the CSVs cannot — they
+were produced before it existed.
+
+They also cannot be regenerated by the current firmware. `sketch.ino` is now a
+different program: joystick-driven attitude hold with a Mahony filter and an
+OLED, emitting four telemetry columns rather than the CSVs' thirteen, with the
+sign correction permanently on and the `UNWINDING_DEMO` toggle gone.
+
+### 3. `invSqrt` only wins on one of the three targets
+
+The Quake III reciprocal square root is worth having *or* worth deleting
+depending entirely on whether the part has an FPU:
+
+| target | FPU | verdict |
+|---|---|---|
+| **Arduino Mega** (ATmega2560) — the Wokwi prototype | none | **wins.** `sqrtf` is a software routine and every float op is a libgcc call, so trading a root and a divide for a shift, a subtract and three multiplies is a real saving |
+| **ESP32** (Xtensa LX6) | yes | **loses.** `1.0f/sqrtf(x)` is a couple of instructions and correctly rounded; the trick also pays to move between integer and float register files |
+| **STM32WBA55** (Cortex-M33F) — the custom board | yes | **loses**, same reason |
+
+So the optimisation is right for the board it was prototyped on and wrong for
+the board it is headed to. `sketch.ino` now selects on `__AVR__` rather than
+assuming. The AVR path also swaps `*(long*)&y` for `memcpy` — the pointer cast
+is a strict-aliasing violation, undefined behaviour that `-O2` is entitled to
+miscompile, and every compiler lowers the `memcpy` to the same register move.
+
+**This is still unmeasured.** The number it needs is a `micros()` loop around
+~10,000 calls of each variant on each board; until that exists the table above
+is an architectural argument, not a result.
+
+---
+
+## The board
+
+![Custom attitude-control board, v1 schematic](docs/schematic.png)
+
+An STM32WBA55HEFx (Cortex-M33 + FPU, integrated radio) on 3V3 from an AMS1117
+LDO, with the joystick on `PA0`/`PA1`, the gain potentiometer on `PA2`, SWD on
+J1, and 4.7 kΩ I²C pull-ups to an off-board IMU on J3.
+
+**v1 is a schematic, not a verified design.** Reviewing the sheet, before
+anything gets fabricated:
+
+- **Decoupling.** The eight supply pins (`VDDA`, `VDD`×3, `VDDSMPS`, `VDDRF`,
+  `VDDRFPA`, `VDDANA`, `VDD11`) are tied to one net, and the only capacitors on
+  the sheet are `C2` (10 µF, regulator input) and `C1` (0.1 µF, output). This
+  part wants ~100 nF per supply pin plus local bulk. Most likely cause of a
+  dead first article.
+- **`NRST` is floating.** It wants the usual 100 nF to ground.
+- **No crystal.** `OSC_IN`/`OSC_OUT` are marked no-connect, so this runs on the
+  internal RC — which rules out the radio that is the reason to pick a WBA55 in
+  the first place. Either add the 32 MHz crystal or drop to a cheaper part.
+- **`VLXSMPS` is no-connect.** The WBA55's internal SMPS needs its inductor to
+  `VDDSMPS`, or the part needs to be configured for LDO mode and tied off per
+  the datasheet. As drawn it is neither.
+- **LDO output cap is light.** The AMS1117 wants ≥10 µF (22 µF tantalum is the
+  datasheet suggestion) for loop stability; 0.1 µF alone is marginal.
+- **Title block still says "mini inverter"** — template leftover from another
+  project.
+
+---
+
+## Status
+
+| Milestone | | State |
+|---|---|---|
+| M0–M1 | Quaternion math + self-test gate | ✅ |
+| M2 | Rigid-body plant as a Wokwi chip (RK4, exponential map) | ✅ |
+| M3 | Closed loop over I²C, perfect sensing | ✅ |
+| M4 | Unwinding experiment | ⚠️ built, **does not yet reproduce the effect** — §1 |
+| M5 | OLED artificial horizon, decoupled from the control loop | ✅ |
+| M7 | Mahony fusion + joystick/potentiometer input | ✅ |
+| M8 | `invSqrt` | ⚠️ now target-conditional, **cost still unmeasured** — §3 |
+| — | Custom PCB v1 schematic | ⚠️ drawn, **not reviewed-clean, not fabricated** — see above |
+
+**Next, in order:** re-run M4 at 359°; benchmark `invSqrt` on Mega and ESP32;
+fix the six schematic items before ordering.
+
+## Running it
+
+The Wokwi project needs `diagram.json`, `sketch.ino`, `chip/`, and the libraries
+in `libraries.txt`. The board is `wokwi-arduino-mega`.
+
+```
+sketch.ino          flight code: Mahony fusion, quaternion PD, OLED, pilot input
+chip/chip.chip.c    the plant — RK4 Euler's equations, I²C fake IMU at 0x42
+diagram.json        Mega + custom chip + SSD1306 + joystick + potentiometer
+docs/schematic.png  custom STM32WBA55 board, v1
+*.csv, *.svg        M4 run data — read §1 before citing these
+```
