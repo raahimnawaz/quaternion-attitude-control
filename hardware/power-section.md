@@ -89,6 +89,15 @@ Note the trade: SMPS-fed, the internal PA reaches ~+6 dBm; VDD-fed (Option A's
 | LDO output cap 0.1 µF | AMS1117 wants ≥10 µF; 22 µF is the datasheet suggestion. `C3` above |
 | Root sheet blank | In KiCad: open `quat_project_pcb_v1_sch.kicad_sch`, *Save As* over `quat_project.kicad_sch`, re-annotate. Fixes the `"mini inverter"` project binding and the title block at the same time |
 
+## Open question — `VDDA` filtering
+
+**Not resolved here; decide it before laying out.** AN5948 gives two options for
+`VDDA`: plain 100 nF ∥ 1 µF, and an LC filter for noisy environments. This board
+runs an ADC (joystick on `PA0`/`PA1`, gain pot on `PA2`) on the same die as a
+2.4 GHz radio, which is the case the LC figure exists for — but whether it is
+needed at this sample rate and resolution is a judgment call, and the answer is
+in the AN5948 figure, not in this file. Look it up rather than guessing.
+
 ## Sanity checks before ordering
 
 1. Run **ERC** with the power pins un-suppressed — v1's 24 no-connect markers
