@@ -152,6 +152,10 @@ eyeballing the sheet, in severity order:
 — no stackup, no footprints, no traces. Footprints *are* assigned to all 11
 symbols, so the netlist would import; nothing has been placed or routed.
 
+➡️ **[`hardware/power-section.md`](hardware/power-section.md)** is the corrected
+wiring to redraw from — both supply modes with the exact pin connections and
+values, the package change, and what to check before ordering.
+
 ---
 
 ## Status
