@@ -1,5 +1,7 @@
 #include "Wire.h"
 #include "math.h"
+#include <stdint.h>
+#include <string.h>
 #include "Adafruit_GFX.h"
 #include "Adafruit_SSD1306.h"
 
@@ -11,17 +13,47 @@ Adafruit_SSD1306 display(SCREEN_WIDTH, SCREEN_HEIGHT, &Wire, OLED_RESET);
 struct Quat { float w, x, y, z; };
 struct Vec3 { float x, y, z; };
 
-// --- LOW LEVEL OPTIMIZATION: Quake III Fast Inverse Square Root ---
-// Calculates 1.0 / sqrt(x) using bit-level manipulation instead of FPU division
-float invSqrt(float x) {
+// --- Reciprocal square root ---
+// Called twice per control loop: once to normalise the accelerometer vector,
+// once to normalise the estimated quaternion.
+//
+// Which implementation is faster depends entirely on whether the target has a
+// hardware FPU, so this is decided at compile time rather than assumed:
+//
+//   Arduino Mega (ATmega2560) — no FPU. Every float operation is a libgcc
+//     call and sqrtf() is a software routine, so trading a square root and a
+//     divide for one shift, one subtract and three multiplies is a genuine
+//     saving. This is the board the Wokwi prototype runs on.
+//
+//   ESP32 (Xtensa LX6) and STM32WBA55 (Cortex-M33F) — both have a
+//     single-precision FPU. 1.0f/sqrtf(x) is a couple of instructions and
+//     correctly rounded, while the bit trick additionally pays to move the
+//     value between the integer and float register files. On these parts the
+//     "optimisation" is slower AND less accurate.
+//
+// The custom board in docs/schematic.png is the STM32WBA55, so on the hardware
+// this project is actually headed for, the fast path is the plain divide.
+#if defined(__AVR__)
+static inline float invSqrt(float x) {
+  // Bit-level initial guess (Quake III) + one Newton-Raphson step.
+  // Worst-case relative error after the single step is ~0.175%.
+  //
+  // memcpy rather than *(long*)&y: the pointer cast is a strict-aliasing
+  // violation, i.e. undefined behaviour that -O2 is entitled to miscompile.
+  // Every compiler in use turns this memcpy into the same register move.
   float halfx = 0.5f * x;
-  float y = x;
-  long i = *(long*)&y;
+  uint32_t i;
+  memcpy(&i, &x, sizeof i);
   i = 0x5f3759df - (i >> 1);
-  y = *(float*)&i;
-  y = y * (1.5f - (halfx * y * y));
-  return y;
+  float y;
+  memcpy(&y, &i, sizeof y);
+  return y * (1.5f - halfx * y * y);
 }
+#else
+static inline float invSqrt(float x) {
+  return 1.0f / sqrtf(x);
+}
+#endif
 
 Quat quat_mul(const Quat& q, const Quat& p) {
   return {
