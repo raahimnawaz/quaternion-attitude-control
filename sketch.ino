@@ -8,6 +8,14 @@
 #define OLED_RESET -1
 Adafruit_SSD1306 display(SCREEN_WIDTH, SCREEN_HEIGHT, &Wire, OLED_RESET);
 
+// Plant register map -- keep in sync with blueprint section 3.1 and chip/chip.chip.c.
+// These were bare hex literals at three call sites, which is how 0x30 came to mean
+// two different things in two different files.
+#define PLANT_ADDR   0x42
+#define REG_Q_TRUE   0x30 // R, 16  ground truth -- SCORING ONLY, never in the control path
+#define REG_TORQUE   0x50 // W, 12
+#define REG_IMU_DATA 0x70 // R, 24  accel x,y,z then gyro x,y,z
+
 struct Quat { float w, x, y, z; };
 struct Vec3 { float x, y, z; };
 
@@ -88,13 +96,21 @@ void loop() {
   last_micros = now;
 
   // --- 1. SENSOR READING (Raw IMU Data) ---
+  // One transaction for both sensors. Two transactions would sample two different
+  // instants of a 1 kHz plant (blueprint trap 6.3); the chip additionally latches
+  // its state on connect so this read is atomic with respect to the physics tick.
   Vec3 accel, gyro;
-  Wire.beginTransmission(0x42);
-  Wire.write(0x30); 
+  Wire.beginTransmission(PLANT_ADDR);
+  Wire.write(REG_IMU_DATA);
   Wire.endTransmission(false);
-  Wire.requestFrom(0x42, 24);
-  Wire.readBytes((uint8_t*)&accel, 12);
-  Wire.readBytes((uint8_t*)&gyro, 12);
+  if (Wire.requestFrom(PLANT_ADDR, 24) == 24) {
+    Wire.readBytes((uint8_t*)&accel, 12);
+    Wire.readBytes((uint8_t*)&gyro, 12);
+  } else {
+    // Short read: readBytes would time out and leave accel/gyro partly filled with
+    // stack garbage, which then gets integrated. Skip this cycle instead.
+    return;
+  }
 
   // --- 2. MAHONY SENSOR FUSION FILTER (Optimized) ---
   float accel_sq = accel.x*accel.x + accel.y*accel.y + accel.z*accel.z;
