@@ -210,19 +210,41 @@ it's very tempting to "just peek" when debugging.
 
 ### 3.1 Register map (I²C, address `0x42`)
 
-| Reg | Dir | Bytes | Meaning |
-|---|---|---|---|
-| `0x00` | R | 1 | `WHO_AM_I` → `0x51` |
-| `0x10` | R | 12 | gyro x,y,z — float32, body frame, rad/s, **noisy + biased** |
-| `0x20` | R | 16 | `q_meas` w,x,y,z — noisy attitude sensor |
-| `0x30` | R | 16 | `q_true` w,x,y,z — **ground truth, scoring only** |
-| `0x40` | R | 12 | `ω_true` x,y,z |
-| `0x50` | W | 12 | torque command x,y,z — float32, N·m |
-| `0x60` | W | 1 | control: bit0 reset, bit1 freeze, bit2 inject bias, bit3 inject dropout |
-| `0x61` | W | 4 | gyro noise σ (float32, rad/s) |
+| Reg | Dir | Bytes | Meaning | Implemented |
+|---|---|---|---|---|
+| `0x00` | R | 1 | `WHO_AM_I` → `0x51` | yes |
+| `0x10` | R | 12 | gyro x,y,z — float32, body frame, rad/s, **noisy**, zero-mean | yes |
+| `0x20` | R | 16 | `q_meas` w,x,y,z — noisy attitude sensor | **no** — superseded at M7 |
+| `0x30` | R | 16 | `q_true` w,x,y,z — **ground truth, scoring only** | yes |
+| `0x40` | R | 12 | `ω_true` x,y,z | yes |
+| `0x50` | W | 12 | torque command x,y,z — float32, N·m | yes |
+| `0x60` | W | 1 | control: bit0 reset, bit1 freeze, bit2 inject bias, bit3 inject dropout | **no** |
+| `0x61` | W | 4 | gyro noise σ (float32, rad/s) | **no** — σ fixed at 0.02 |
+| `0x70` | R | 24 | accel x,y,z **then** gyro x,y,z — float32, body frame, **noisy** | yes |
 
 Multi-byte reads auto-increment the register pointer. Standard pattern: master
 writes the register address, then issues a repeated-start read.
+
+**Why `0x70` exists.** M7 replaced the `q_meas` attitude sensor with a raw
+accelerometer and gyro, which is what forces a real fusion filter instead of a
+smoothing filter. Those two vectors must be read in one transaction, and 24 bytes
+do not fit at `0x10` — `0x10 + 24` runs into `q_meas` at `0x20`. So the combined
+block lives at `0x70` and `0x10` keeps serving gyro-only at its documented 12
+bytes. Both views are served from the same latched snapshot and cannot disagree.
+
+**Reads are latched.** The plant integrates at 1 kHz and a 24-byte read at
+400 kHz occupies the bus for roughly 600 µs, so the physics tick fires *during*
+transactions. The chip therefore snapshots its entire readable state when a read
+transaction opens and serves every byte from that snapshot. Reading a quaternion
+in one transaction (§6.3) is necessary but not sufficient — the plant also has to
+hold still while you read it.
+
+> **`0x20`, `0x60` and `0x61` are specified here but not built.** They were
+> `#define`d in the v1 chip and never appeared in its read or write handlers, so
+> they have never worked. `0x60` is the gap worth closing first: without it, M7's
+> "inject bias" and "inject dropout" demonstrations cannot be triggered at all,
+> and the gyro model is currently zero-mean noise with **no bias term**, which is
+> why the description at `0x10` no longer claims one.
 
 > **Trap.** Read all four quaternion floats in **one** I²C transaction. Four
 > separate transactions sample four different instants of a plant running at

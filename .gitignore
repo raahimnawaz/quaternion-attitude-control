@@ -1,0 +1,37 @@
+# --- KiCad ---
+# Backups, autosaves, and the lock/cache files KiCad regenerates on open.
+*-backups/
+*.kicad_prl
+*.kicad_sch-bak
+*.kicad_pcb-bak
+*.bak
+*.lck
+~*.*
+fp-info-cache
+# Fabrication output is regenerated from the source files; do not track it.
+gerbers/
+*.gbr
+*.drl
+*.zip
+
+# --- Wokwi / build ---
+# Compiled custom-chip binaries. chip.chip.c is the source of truth.
+*.wasm
+build/
+.build/
+dist/
+
+# --- Analysis tooling ---
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+.ipynb_checkpoints/
+
+# --- Editors / OS ---
+.vscode/
+.idea/
+*.swp
+.DS_Store
+Thumbs.db
+desktop.ini
