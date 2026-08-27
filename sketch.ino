@@ -113,6 +113,11 @@ void loop() {
   }
 
   // --- 2. MAHONY SENSOR FUSION FILTER (Optimized) ---
+  // The filter mutates `gyro` in place into a corrected rate for the integrator.
+  // The PD law's derivative term needs the raw measurement, not that corrected
+  // value -- see the note at the control law. Keep a copy before it is touched.
+  const Vec3 gyro_raw = gyro;
+
   float accel_sq = accel.x*accel.x + accel.y*accel.y + accel.z*accel.z;
   if (accel_sq > 0.0f) {
     // Fast normalization using multiplication
@@ -170,10 +175,13 @@ void loop() {
   Quat q_err = quat_mul(q_est_inv, q_cmd);
   float sign_w = (q_err.w >= 0.0f) ? 1.0f : -1.0f; 
 
+  // Derivative term uses gyro_raw, not the Mahony-corrected gyro. The corrected
+  // value carries Kp_imu * (accelerometer residual), so feeding it here would
+  // multiply accelerometer noise by Kp_imu * Kd straight into the torque command.
   Vec3 tau;
-  tau.x = (Kp_base[0] * gain_multiplier) * sign_w * q_err.x - (Kd_base[0] * gain_multiplier) * gyro.x;
-  tau.y = (Kp_base[1] * gain_multiplier) * sign_w * q_err.y - (Kd_base[1] * gain_multiplier) * gyro.y;
-  tau.z = (Kp_base[2] * gain_multiplier) * sign_w * q_err.z - (Kd_base[2] * gain_multiplier) * gyro.z;
+  tau.x = (Kp_base[0] * gain_multiplier) * sign_w * q_err.x - (Kd_base[0] * gain_multiplier) * gyro_raw.x;
+  tau.y = (Kp_base[1] * gain_multiplier) * sign_w * q_err.y - (Kd_base[1] * gain_multiplier) * gyro_raw.y;
+  tau.z = (Kp_base[2] * gain_multiplier) * sign_w * q_err.z - (Kd_base[2] * gain_multiplier) * gyro_raw.z;
 
   Wire.beginTransmission(0x42);
   Wire.write(0x50);
