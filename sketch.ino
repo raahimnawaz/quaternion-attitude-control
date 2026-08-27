@@ -1,5 +1,6 @@
 #include "Wire.h"
 #include "math.h"
+#include "string.h"
 #include "Adafruit_GFX.h"
 #include "Adafruit_SSD1306.h"
 
@@ -8,19 +9,44 @@
 #define OLED_RESET -1
 Adafruit_SSD1306 display(SCREEN_WIDTH, SCREEN_HEIGHT, &Wire, OLED_RESET);
 
+// Plant register map -- keep in sync with blueprint section 3.1 and chip/chip.chip.c.
+// These were bare hex literals at three call sites, which is how 0x30 came to mean
+// two different things in two different files.
+#define PLANT_ADDR   0x42
+#define REG_Q_TRUE   0x30 // R, 16  ground truth -- SCORING ONLY, never in the control path
+#define REG_TORQUE   0x50 // W, 12
+#define REG_IMU_DATA 0x70 // R, 24  accel x,y,z then gyro x,y,z
+
 struct Quat { float w, x, y, z; };
 struct Vec3 { float x, y, z; };
 
 // --- LOW LEVEL OPTIMIZATION: Quake III Fast Inverse Square Root ---
-// Calculates 1.0 / sqrt(x) using bit-level manipulation instead of FPU division
+// Calculates 1.0 / sqrt(x) using bit-level manipulation instead of FPU division.
+// The magic constant lands within ~3.4% ; one Newton-Raphson step takes that to a
+// worst-case relative error of ~1.75e-3.
+//
+// That is fine for normalising a direction vector, and NOT fine for normalising
+// q_est -- see invSqrtRefined.
 float invSqrt(float x) {
   float halfx = 0.5f * x;
   float y = x;
-  long i = *(long*)&y;
-  i = 0x5f3759df - (i >> 1);
-  y = *(float*)&i;
+  // memcpy rather than *(long*)&y: type-punning through a pointer cast is
+  // undefined behaviour, and `long` is not 32 bits everywhere. Both compile to
+  // the same AVR instructions. See the commit message.
+  uint32_t i;
+  memcpy(&i, &y, sizeof(i));
+  i = 0x5f3759dfUL - (i >> 1);
+  memcpy(&y, &i, sizeof(y));
   y = y * (1.5f - (halfx * y * y));
   return y;
+}
+
+// A second Newton-Raphson step. Convergence is quadratic (err' ~ 1.5 * err^2), so
+// ~1.75e-3 becomes ~4.6e-6: about 380x tighter for three multiplies and a
+// subtract. Used only for the quaternion, once per loop.
+float invSqrtRefined(float x) {
+  float y = invSqrt(x);
+  return y * (1.5f - (0.5f * x * y * y));
 }
 
 Quat quat_mul(const Quat& q, const Quat& p) {
@@ -34,6 +60,10 @@ Quat quat_mul(const Quat& q, const Quat& p) {
 
 Quat quat_conj(const Quat& q) {
   return { q.w, -q.x, -q.y, -q.z };
+}
+
+static inline float clampf(float v, float lo, float hi) {
+  return v < lo ? lo : (v > hi ? hi : v);
 }
 
 Quat quat_from_euler(float roll, float pitch, float yaw) {
@@ -88,15 +118,28 @@ void loop() {
   last_micros = now;
 
   // --- 1. SENSOR READING (Raw IMU Data) ---
+  // One transaction for both sensors. Two transactions would sample two different
+  // instants of a 1 kHz plant (blueprint trap 6.3); the chip additionally latches
+  // its state on connect so this read is atomic with respect to the physics tick.
   Vec3 accel, gyro;
-  Wire.beginTransmission(0x42);
-  Wire.write(0x30); 
+  Wire.beginTransmission(PLANT_ADDR);
+  Wire.write(REG_IMU_DATA);
   Wire.endTransmission(false);
-  Wire.requestFrom(0x42, 24);
-  Wire.readBytes((uint8_t*)&accel, 12);
-  Wire.readBytes((uint8_t*)&gyro, 12);
+  if (Wire.requestFrom(PLANT_ADDR, 24) == 24) {
+    Wire.readBytes((uint8_t*)&accel, 12);
+    Wire.readBytes((uint8_t*)&gyro, 12);
+  } else {
+    // Short read: readBytes would time out and leave accel/gyro partly filled with
+    // stack garbage, which then gets integrated. Skip this cycle instead.
+    return;
+  }
 
   // --- 2. MAHONY SENSOR FUSION FILTER (Optimized) ---
+  // The filter mutates `gyro` in place into a corrected rate for the integrator.
+  // The PD law's derivative term needs the raw measurement, not that corrected
+  // value -- see the note at the control law. Keep a copy before it is touched.
+  const Vec3 gyro_raw = gyro;
+
   float accel_sq = accel.x*accel.x + accel.y*accel.y + accel.z*accel.z;
   if (accel_sq > 0.0f) {
     // Fast normalization using multiplication
@@ -135,8 +178,10 @@ void loop() {
   q_est.y += q_dot.y * dt;
   q_est.z += q_dot.z * dt;
 
-  // Fast quaternion normalization
-  float q_norm_inv = invSqrt(q_est.w*q_est.w + q_est.x*q_est.x + q_est.y*q_est.y + q_est.z*q_est.z);
+  // Fast quaternion normalization -- refined, because this error is the one that
+  // compounds and the one that reaches asin(). Once per loop, so the extra
+  // Newton step is the cheapest accuracy in the sketch.
+  float q_norm_inv = invSqrtRefined(q_est.w*q_est.w + q_est.x*q_est.x + q_est.y*q_est.y + q_est.z*q_est.z);
   q_est.w *= q_norm_inv; 
   q_est.x *= q_norm_inv; 
   q_est.y *= q_norm_inv; 
@@ -154,10 +199,13 @@ void loop() {
   Quat q_err = quat_mul(q_est_inv, q_cmd);
   float sign_w = (q_err.w >= 0.0f) ? 1.0f : -1.0f; 
 
+  // Derivative term uses gyro_raw, not the Mahony-corrected gyro. The corrected
+  // value carries Kp_imu * (accelerometer residual), so feeding it here would
+  // multiply accelerometer noise by Kp_imu * Kd straight into the torque command.
   Vec3 tau;
-  tau.x = (Kp_base[0] * gain_multiplier) * sign_w * q_err.x - (Kd_base[0] * gain_multiplier) * gyro.x;
-  tau.y = (Kp_base[1] * gain_multiplier) * sign_w * q_err.y - (Kd_base[1] * gain_multiplier) * gyro.y;
-  tau.z = (Kp_base[2] * gain_multiplier) * sign_w * q_err.z - (Kd_base[2] * gain_multiplier) * gyro.z;
+  tau.x = (Kp_base[0] * gain_multiplier) * sign_w * q_err.x - (Kd_base[0] * gain_multiplier) * gyro_raw.x;
+  tau.y = (Kp_base[1] * gain_multiplier) * sign_w * q_err.y - (Kd_base[1] * gain_multiplier) * gyro_raw.y;
+  tau.z = (Kp_base[2] * gain_multiplier) * sign_w * q_err.z - (Kd_base[2] * gain_multiplier) * gyro_raw.z;
 
   Wire.beginTransmission(0x42);
   Wire.write(0x50);
@@ -170,7 +218,10 @@ void loop() {
     last_oled_millis = millis();
     
     float roll  = atan2(2.0f * (q_est.w * q_est.x + q_est.y * q_est.z), 1.0f - 2.0f * (q_est.x * q_est.x + q_est.y * q_est.y));
-    float pitch = asin(2.0f * (q_est.w * q_est.y - q_est.z * q_est.x));
+    // The clamp is load-bearing (blueprint 2.7). Float error in the norm pushes
+    // this argument past +/-1 and asin returns NaN, which reaches the display and
+    // reads as a controller failure rather than a numerics failure.
+    float pitch = asin(clampf(2.0f * (q_est.w * q_est.y - q_est.z * q_est.x), -1.0f, 1.0f));
 
     display.clearDisplay();
     display.drawFastHLine(64 - 15, 32, 10, SSD1306_WHITE); 
@@ -189,10 +240,41 @@ void loop() {
     display.drawLine(x0, y0, x1, y1, SSD1306_WHITE);
     display.display();
     
-    // Print telemetry out for the Python dashboard
+    // --- GROUND TRUTH: SCORING ONLY ---
+    // Read here, inside the telemetry block, and never above it. By the time this
+    // runs the torque command has already gone out, and q_true lives in a local
+    // that dies at the end of this scope -- so there is no name the control path
+    // could refer to it by even by accident. M7's whole premise is that the
+    // estimator does not get to see truth (trap 6.6), and scope enforces that
+    // better than a comment asking the next person not to.
+    //
+    // 16 bytes in one transaction. Four separate reads would assemble a
+    // quaternion out of four different instants of a 1 kHz plant (trap 6.3).
+    Quat q_true = {1.0f, 0.0f, 0.0f, 0.0f};
+    bool truth_ok = false;
+    Wire.beginTransmission(PLANT_ADDR);
+    Wire.write(REG_Q_TRUE);
+    Wire.endTransmission(false);
+    if (Wire.requestFrom(PLANT_ADDR, 16) == 16) {
+      Wire.readBytes((uint8_t*)&q_true, 16);
+      truth_ok = true;
+    }
+
+    // Telemetry for the Python dashboard.
+    // Columns: q_est.w,q_est.x,q_est.y,q_est.z,q_true.w,q_true.x,q_true.y,q_true.z
+    // Raw quaternions rather than a precomputed error angle -- the scoring metric
+    // should be changeable without reflashing, and the MCU has better things to do.
     Serial.print(q_est.w, 4); Serial.print(",");
     Serial.print(q_est.x, 4); Serial.print(",");
     Serial.print(q_est.y, 4); Serial.print(",");
-    Serial.println(q_est.z, 4);
+    Serial.print(q_est.z, 4); Serial.print(",");
+    if (truth_ok) {
+      Serial.print(q_true.w, 4); Serial.print(",");
+      Serial.print(q_true.x, 4); Serial.print(",");
+      Serial.print(q_true.y, 4); Serial.print(",");
+      Serial.println(q_true.z, 4);
+    } else {
+      Serial.println("nan,nan,nan,nan");
+    }
   }
 }
