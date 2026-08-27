@@ -235,10 +235,41 @@ void loop() {
     display.drawLine(x0, y0, x1, y1, SSD1306_WHITE);
     display.display();
     
-    // Print telemetry out for the Python dashboard
+    // --- GROUND TRUTH: SCORING ONLY ---
+    // Read here, inside the telemetry block, and never above it. By the time this
+    // runs the torque command has already gone out, and q_true lives in a local
+    // that dies at the end of this scope -- so there is no name the control path
+    // could refer to it by even by accident. M7's whole premise is that the
+    // estimator does not get to see truth (trap 6.6), and scope enforces that
+    // better than a comment asking the next person not to.
+    //
+    // 16 bytes in one transaction. Four separate reads would assemble a
+    // quaternion out of four different instants of a 1 kHz plant (trap 6.3).
+    Quat q_true = {1.0f, 0.0f, 0.0f, 0.0f};
+    bool truth_ok = false;
+    Wire.beginTransmission(PLANT_ADDR);
+    Wire.write(REG_Q_TRUE);
+    Wire.endTransmission(false);
+    if (Wire.requestFrom(PLANT_ADDR, 16) == 16) {
+      Wire.readBytes((uint8_t*)&q_true, 16);
+      truth_ok = true;
+    }
+
+    // Telemetry for the Python dashboard.
+    // Columns: q_est.w,q_est.x,q_est.y,q_est.z,q_true.w,q_true.x,q_true.y,q_true.z
+    // Raw quaternions rather than a precomputed error angle -- the scoring metric
+    // should be changeable without reflashing, and the MCU has better things to do.
     Serial.print(q_est.w, 4); Serial.print(",");
     Serial.print(q_est.x, 4); Serial.print(",");
     Serial.print(q_est.y, 4); Serial.print(",");
-    Serial.println(q_est.z, 4);
+    Serial.print(q_est.z, 4); Serial.print(",");
+    if (truth_ok) {
+      Serial.print(q_true.w, 4); Serial.print(",");
+      Serial.print(q_true.x, 4); Serial.print(",");
+      Serial.print(q_true.y, 4); Serial.print(",");
+      Serial.println(q_true.z, 4);
+    } else {
+      Serial.println("nan,nan,nan,nan");
+    }
   }
 }
