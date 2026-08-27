@@ -9,3 +9,6 @@ _autosave-*
 # KiCad build output
 *.net
 gerbers/
+
+# PlatformIO local build output
+.pio/

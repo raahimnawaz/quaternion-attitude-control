@@ -1,6 +1,0 @@
-{
-  "name": "rigid-body",
-  "author": "Raahim Nawaz",
-  "pins": [ "GND", "VCC", "SDA", "SCL" ],
-  "controls": []
-}
