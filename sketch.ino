@@ -120,15 +120,27 @@ void loop() {
   last_micros = now;
 
   // --- 1. SENSOR READING (Raw IMU Data) ---
-  Vec3 accel, gyro;
+  Vec3 accel = {0.0f, 0.0f, 0.0f};
+  Vec3 gyro  = {0.0f, 0.0f, 0.0f};
   Wire.beginTransmission(0x42);
   Wire.write(0x30); 
   Wire.endTransmission(false);
-  Wire.requestFrom(0x42, 24);
+  // A short read would leave the structs holding garbage and feed it straight
+  // into the filter. Hold the last commanded torque instead -- a zero-order
+  // hold is the right failure mode for one dropped sample.
+  if (Wire.requestFrom(0x42, 24) != 24) return;
   Wire.readBytes((uint8_t*)&accel, 12);
   Wire.readBytes((uint8_t*)&gyro, 12);
 
   // --- 2. MAHONY SENSOR FUSION FILTER (Optimized) ---
+  // The PD damping term needs the *measured* body rate. The Mahony correction
+  // below adds Kp_imu * (a x v_est) into `gyro` in place -- that term is an
+  // estimator feedback injection, not part of the angular rate. Feeding it to
+  // the controller routes estimator error straight into commanded torque
+  // (Kd*Kp_imu = 10.5 against a Kp of 18) and amplifies accelerometer noise
+  // into the actuator by 2.5x. Keep a clean copy before the correction lands.
+  Vec3 gyro_meas = gyro;
+
   float accel_sq = accel.x*accel.x + accel.y*accel.y + accel.z*accel.z;
   if (accel_sq > 0.0f) {
     // Fast normalization using multiplication
@@ -187,9 +199,9 @@ void loop() {
   float sign_w = (q_err.w >= 0.0f) ? 1.0f : -1.0f; 
 
   Vec3 tau;
-  tau.x = (Kp_base[0] * gain_multiplier) * sign_w * q_err.x - (Kd_base[0] * gain_multiplier) * gyro.x;
-  tau.y = (Kp_base[1] * gain_multiplier) * sign_w * q_err.y - (Kd_base[1] * gain_multiplier) * gyro.y;
-  tau.z = (Kp_base[2] * gain_multiplier) * sign_w * q_err.z - (Kd_base[2] * gain_multiplier) * gyro.z;
+  tau.x = (Kp_base[0] * gain_multiplier) * sign_w * q_err.x - (Kd_base[0] * gain_multiplier) * gyro_meas.x;
+  tau.y = (Kp_base[1] * gain_multiplier) * sign_w * q_err.y - (Kd_base[1] * gain_multiplier) * gyro_meas.y;
+  tau.z = (Kp_base[2] * gain_multiplier) * sign_w * q_err.z - (Kd_base[2] * gain_multiplier) * gyro_meas.z;
 
   Wire.beginTransmission(0x42);
   Wire.write(0x50);
@@ -202,7 +214,13 @@ void loop() {
     last_oled_millis = millis();
     
     float roll  = atan2(2.0f * (q_est.w * q_est.x + q_est.y * q_est.z), 1.0f - 2.0f * (q_est.x * q_est.x + q_est.y * q_est.y));
-    float pitch = asin(2.0f * (q_est.w * q_est.y - q_est.z * q_est.x));
+    // Clamp before asin: float error can push this a hair outside [-1, 1] at
+    // pitch = +/-90 deg, and the resulting NaN propagates silently through the
+    // display and every downstream comparison. (Blueprint 6.5.)
+    float sin_pitch = 2.0f * (q_est.w * q_est.y - q_est.z * q_est.x);
+    if (sin_pitch >  1.0f) sin_pitch =  1.0f;
+    if (sin_pitch < -1.0f) sin_pitch = -1.0f;
+    float pitch = asin(sin_pitch);
 
     display.clearDisplay();
     display.drawFastHLine(64 - 15, 32, 10, SSD1306_WHITE); 
