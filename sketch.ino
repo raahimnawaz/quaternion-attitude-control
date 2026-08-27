@@ -57,6 +57,10 @@ Quat quat_conj(const Quat& q) {
   return { q.w, -q.x, -q.y, -q.z };
 }
 
+static inline float clampf(float v, float lo, float hi) {
+  return v < lo ? lo : (v > hi ? hi : v);
+}
+
 Quat quat_from_euler(float roll, float pitch, float yaw) {
   float cr = cos(roll * 0.5f);
   float sr = sin(roll * 0.5f);
@@ -209,7 +213,10 @@ void loop() {
     last_oled_millis = millis();
     
     float roll  = atan2(2.0f * (q_est.w * q_est.x + q_est.y * q_est.z), 1.0f - 2.0f * (q_est.x * q_est.x + q_est.y * q_est.y));
-    float pitch = asin(2.0f * (q_est.w * q_est.y - q_est.z * q_est.x));
+    // The clamp is load-bearing (blueprint 2.7). Float error in the norm pushes
+    // this argument past +/-1 and asin returns NaN, which reaches the display and
+    // reads as a controller failure rather than a numerics failure.
+    float pitch = asin(clampf(2.0f * (q_est.w * q_est.y - q_est.z * q_est.x), -1.0f, 1.0f));
 
     display.clearDisplay();
     display.drawFastHLine(64 - 15, 32, 10, SSD1306_WHITE); 
