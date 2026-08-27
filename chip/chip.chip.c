@@ -125,14 +125,19 @@ static bool on_i2c_connect(void *user_data, uint32_t address, bool is_write) {
   // measurements that never coexisted.
   //
   // Latching the whole readable state here makes every transaction atomic with
-  // respect to the physics tick. A read transaction opens with a repeated START
-  // after the register-pointer write, so this fires immediately before the data.
-  if (!is_write) {
-    memcpy(chip->snap.q,     chip->q,         sizeof(chip->snap.q));
-    memcpy(chip->snap.w,     chip->w,         sizeof(chip->snap.w));
-    memcpy(chip->snap.accel, chip->accel_out, sizeof(chip->snap.accel));
-    memcpy(chip->snap.gyro,  chip->gyro_out,  sizeof(chip->snap.gyro));
-  }
+  // respect to the physics tick.
+  //
+  // Unconditional, not gated on !is_write. The read path is addressed twice --
+  // once to write the register pointer, then a repeated START for the data -- and
+  // gating on !is_write would depend on Wokwi re-invoking this callback for that
+  // repeated START. If it does not, the snapshot would never refresh and every
+  // read would serve stale data, which is worse than the tearing this fixes.
+  // Latching on both addressings costs one extra memcpy on write transactions and
+  // removes the dependency on that behaviour entirely.
+  memcpy(chip->snap.q,     chip->q,         sizeof(chip->snap.q));
+  memcpy(chip->snap.w,     chip->w,         sizeof(chip->snap.w));
+  memcpy(chip->snap.accel, chip->accel_out, sizeof(chip->snap.accel));
+  memcpy(chip->snap.gyro,  chip->gyro_out,  sizeof(chip->snap.gyro));
   return true;
 }
 
