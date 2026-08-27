@@ -1,0 +1,36 @@
+# Normalise line endings. Without this, a Windows checkout commits CRLF, a CI
+# runner on Linux commits LF, and the two produce whole-file diffs in which
+# nothing actually changed.
+* text=auto eol=lf
+
+# Sources -- always LF in the repository.
+*.c      text eol=lf
+*.h      text eol=lf
+*.ino    text eol=lf
+*.md     text eol=lf
+*.json   text eol=lf
+*.csv    text eol=lf
+*.txt    text eol=lf
+*.yml    text eol=lf
+*.yaml   text eol=lf
+
+# KiCad files are text, but KiCad rewrites whole s-expression blocks on save and
+# the diffs are not meaningfully reviewable. Keep them LF; do not try to merge.
+*.kicad_sch  text eol=lf -merge
+*.kicad_pcb  text eol=lf -merge
+*.kicad_pro  text eol=lf -merge
+
+# Binary -- never touch, never diff.
+*.wasm   binary
+*.png    binary
+*.jpg    binary
+*.pdf    binary
+
+# SVGs here are plot exports with text rendered as paths. They are technically
+# text but a one-line diff is meaningless, so keep them out of diff output.
+*.svg    text eol=lf -diff
+
+# Keep generated results out of GitHub's language statistics; this is a firmware
+# project, not an SVG project.
+results/*.svg linguist-generated=true
+docs/*        linguist-documentation=true
