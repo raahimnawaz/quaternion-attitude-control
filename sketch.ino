@@ -20,7 +20,12 @@ struct Quat { float w, x, y, z; };
 struct Vec3 { float x, y, z; };
 
 // --- LOW LEVEL OPTIMIZATION: Quake III Fast Inverse Square Root ---
-// Calculates 1.0 / sqrt(x) using bit-level manipulation instead of FPU division
+// Calculates 1.0 / sqrt(x) using bit-level manipulation instead of FPU division.
+// The magic constant lands within ~3.4% ; one Newton-Raphson step takes that to a
+// worst-case relative error of ~1.75e-3.
+//
+// That is fine for normalising a direction vector, and NOT fine for normalising
+// q_est -- see invSqrtRefined.
 float invSqrt(float x) {
   float halfx = 0.5f * x;
   float y = x;
@@ -29,6 +34,14 @@ float invSqrt(float x) {
   y = *(float*)&i;
   y = y * (1.5f - (halfx * y * y));
   return y;
+}
+
+// A second Newton-Raphson step. Convergence is quadratic (err' ~ 1.5 * err^2), so
+// ~1.75e-3 becomes ~4.6e-6: about 380x tighter for three multiplies and a
+// subtract. Used only for the quaternion, once per loop.
+float invSqrtRefined(float x) {
+  float y = invSqrt(x);
+  return y * (1.5f - (0.5f * x * y * y));
 }
 
 Quat quat_mul(const Quat& q, const Quat& p) {
@@ -156,8 +169,10 @@ void loop() {
   q_est.y += q_dot.y * dt;
   q_est.z += q_dot.z * dt;
 
-  // Fast quaternion normalization
-  float q_norm_inv = invSqrt(q_est.w*q_est.w + q_est.x*q_est.x + q_est.y*q_est.y + q_est.z*q_est.z);
+  // Fast quaternion normalization -- refined, because this error is the one that
+  // compounds and the one that reaches asin(). Once per loop, so the extra
+  // Newton step is the cheapest accuracy in the sketch.
+  float q_norm_inv = invSqrtRefined(q_est.w*q_est.w + q_est.x*q_est.x + q_est.y*q_est.y + q_est.z*q_est.z);
   q_est.w *= q_norm_inv; 
   q_est.x *= q_norm_inv; 
   q_est.y *= q_norm_inv; 
