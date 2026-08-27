@@ -4,9 +4,15 @@
 #include <string.h>
 #include <math.h>
 
-#define REG_WHO_AM_I   0x00
-#define REG_IMU_DATA   0x30 // Base register for Accel + Gyro
-#define REG_TORQUE     0x50
+// Register map -- keep in sync with blueprint section 3.1.
+#define REG_WHO_AM_I   0x00 // R,  1  -> 0x51
+#define REG_GYRO       0x10 // R, 12  gyro x,y,z          float32, body frame, rad/s
+#define REG_Q_TRUE     0x30 // R, 16  q_true w,x,y,z      GROUND TRUTH -- scoring only
+#define REG_W_TRUE     0x40 // R, 12  w_true x,y,z        GROUND TRUTH -- scoring only
+#define REG_TORQUE     0x50 // W, 12  torque x,y,z        float32, N.m
+#define REG_IMU_DATA   0x70 // R, 24  accel x,y,z then gyro x,y,z -- one atomic read
+
+#define WHO_AM_I_VALUE 0x51
 
 // Everything the master can read, frozen at the instant a read transaction opens.
 // See on_i2c_connect for why this exists.
@@ -130,17 +136,37 @@ static bool on_i2c_connect(void *user_data, uint32_t address, bool is_write) {
   return true;
 }
 
+// Little-endian float32 on the wire; AVR and WASM agree, so a raw byte view is
+// the whole serialisation. Blueprint section 1.
+static uint8_t byte_of(const float *src, uint8_t offset) {
+  return ((const uint8_t *)src)[offset];
+}
+
 static uint8_t on_i2c_read(void *user_data) {
   chip_state_t *chip = (chip_state_t *)user_data;
   uint8_t data = 0;
   uint8_t reg = chip->current_reg;
 
-  // Serve Accel (12 bytes) then Gyro (12 bytes) = 24 bytes total
-  if (reg >= REG_IMU_DATA && reg < REG_IMU_DATA + 12) {
-    data = ((uint8_t*)chip->snap.accel)[reg - REG_IMU_DATA];
+  if (reg == REG_WHO_AM_I) {
+    data = WHO_AM_I_VALUE;
+  }
+  else if (reg >= REG_GYRO && reg < REG_GYRO + 12) {
+    data = byte_of(chip->snap.gyro, reg - REG_GYRO);
+  }
+  // Ground truth. The controller must never read these -- see blueprint M7 and
+  // trap 6.6. They exist so the host can score the estimator against the plant.
+  else if (reg >= REG_Q_TRUE && reg < REG_Q_TRUE + 16) {
+    data = byte_of(chip->snap.q, reg - REG_Q_TRUE);
+  }
+  else if (reg >= REG_W_TRUE && reg < REG_W_TRUE + 12) {
+    data = byte_of(chip->snap.w, reg - REG_W_TRUE);
+  }
+  // Combined IMU block: accel (12 bytes) then gyro (12 bytes) = 24 bytes total.
+  else if (reg >= REG_IMU_DATA && reg < REG_IMU_DATA + 12) {
+    data = byte_of(chip->snap.accel, reg - REG_IMU_DATA);
   }
   else if (reg >= REG_IMU_DATA + 12 && reg < REG_IMU_DATA + 24) {
-    data = ((uint8_t*)chip->snap.gyro)[reg - (REG_IMU_DATA + 12)];
+    data = byte_of(chip->snap.gyro, reg - (REG_IMU_DATA + 12));
   }
 
   chip->current_reg++;
