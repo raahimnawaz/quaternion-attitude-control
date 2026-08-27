@@ -1,5 +1,6 @@
 #include "Wire.h"
 #include "math.h"
+#include "string.h"
 #include "Adafruit_GFX.h"
 #include "Adafruit_SSD1306.h"
 
@@ -29,9 +30,13 @@ struct Vec3 { float x, y, z; };
 float invSqrt(float x) {
   float halfx = 0.5f * x;
   float y = x;
-  long i = *(long*)&y;
-  i = 0x5f3759df - (i >> 1);
-  y = *(float*)&i;
+  // memcpy rather than *(long*)&y: type-punning through a pointer cast is
+  // undefined behaviour, and `long` is not 32 bits everywhere. Both compile to
+  // the same AVR instructions. See the commit message.
+  uint32_t i;
+  memcpy(&i, &y, sizeof(i));
+  i = 0x5f3759dfUL - (i >> 1);
+  memcpy(&y, &i, sizeof(y));
   y = y * (1.5f - (halfx * y * y));
   return y;
 }
