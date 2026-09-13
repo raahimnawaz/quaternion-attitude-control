@@ -115,6 +115,83 @@ m = 1. The knob is a damping control wearing a gain control's clothing.
 
 ---
 
+### `invSqrt` only wins on one of the three targets
+
+The Quake III reciprocal square root is worth having *or* worth deleting
+depending entirely on whether the part has an FPU:
+
+| target | FPU | verdict |
+|---|---|---|
+| **Arduino Mega** (ATmega2560) — the Wokwi prototype | none | **wins.** `sqrtf` is a software routine and every float op is a libgcc call, so trading a root and a divide for a shift, a subtract and three multiplies is a real saving |
+| **ESP32** (Xtensa LX6) | yes | **loses.** `1.0f/sqrtf(x)` is a couple of instructions and correctly rounded; the trick also pays to move between integer and float register files |
+| **STM32WBA55** (Cortex-M33F) — the custom board | yes | **loses**, same reason |
+
+So the optimisation is right for the board it was prototyped on and wrong for
+the board it is headed to. `sketch.ino` now selects on `__AVR__` rather than
+assuming. The AVR path also swaps `*(long*)&y` for `memcpy` — the pointer cast
+is a strict-aliasing violation, undefined behaviour that `-O2` is entitled to
+miscompile, and every compiler lowers the `memcpy` to the same register move.
+
+**This is still unmeasured.** The number it needs is a `micros()` loop around
+~10,000 calls of each variant on each board; until that exists the table above
+is an architectural argument, not a result.
+
+---
+
+## The board
+
+![Custom attitude-control board, v1 schematic](docs/schematic.png)
+
+An STM32WBA55HEFx (Cortex-M33 + FPU, integrated radio) on 3V3 from an AMS1117
+LDO, with the joystick on `PA0`/`PA1`, the gain potentiometer on `PA2`, SWD on
+J1, and 4.7 kΩ I²C pull-ups to an off-board IMU on J3.
+
+**v1 is a schematic, and it should not be fabricated as drawn.** The whole
+design is 11 components. Tracing the netlist out of the `.kicad_sch` rather than
+eyeballing the sheet, in severity order:
+
+1. **`VDD11` is tied to +3V3.** Every supply pin — `VDD`, `VDDA`, `VDDANA`,
+   `VDDHPA`, `VDDRF`, `VDDRFPA`, `VDDSMPS` **and `VDD11`** — sits on one net.
+   `VDD11` is the 1.1 V core/radio domain, not a supply input. Driving 3.3 V
+   into it is a part-killer, and it is consistent with the next item: the SMPS
+   that is supposed to *produce* that rail has been no-connected instead.
+2. **`VLXSMPS` is no-connect.** The internal SMPS needs its inductor between
+   `VLXSMPS` and `VDD11`, or the part must be strapped for LDO mode per the
+   datasheet's power-supply scheme. As drawn it is neither, which is how 1
+   happened. **Fix these two together — read the datasheet's supply table and
+   redraw the power section from it.**
+3. **The package is `ST_WLCSP-41_2.98x2.76mm_P0.4mm_Stagger`.** A 41-ball
+   wafer-level chip-scale part on 0.4 mm staggered pitch: bare die, no leads.
+   That needs HDI with via-in-pad and laser microvias, a stencil and reflow, and
+   it cannot be hand-soldered, reworked, or probed. It is also light-sensitive.
+   The QFN version of the same silicon is routable on two layers and solderable
+   with an iron. Unless there is a size constraint that justifies it, **this one
+   choice is what makes the board unbuildable at hobby scale.**
+4. **Decoupling is one capacitor.** `C1` (0.1 µF) and `C2` (10 µF) are the only
+   caps on the sheet, both at the regulator. Eight supply pins want ~100 nF each
+   placed at the ball, plus bulk. On a normal package this is the single most
+   common reason a first article is dead on arrival.
+5. **No crystal.** `OSC_IN`/`OSC_OUT` are no-connect, so this runs on the
+   internal RC — which rules out the radio that is the reason to choose a WBA55.
+   Either add the 32 MHz crystal or drop to a cheaper, non-wireless part.
+6. **`NRST` floats.** It wants the usual 100 nF to ground.
+7. **LDO output cap is light.** The AMS1117 wants ≥10 µF (the datasheet suggests
+   22 µF tantalum) to stay stable; 0.1 µF alone is marginal.
+8. **The project's root sheet is empty.** `hardware/quat_project.kicad_sch` is a
+   blank A4 page, and the real design lives in
+   `quat_project_pcb_v1_sch.kicad_sch`, which nothing references — so opening the
+   project shows nothing. Every symbol's instance path is also still bound to
+   `(project "mini inverter")`, and the title block says the same. The design was
+   started by copying another project and never rebound.
+
+**There is no layout.** `hardware/quat_project.kicad_pcb` is an empty board file
+— no stackup, no footprints, no traces. Footprints *are* assigned to all 11
+symbols, so the netlist would import; nothing has been placed or routed.
+
+➡️ **[`hardware/power-section.md`](hardware/power-section.md)** is the corrected
+wiring to redraw from — both supply modes with the exact pin connections and
+values, the package change, and what to check before ordering.
+
 ## Known limitations
 
 The simulation is honest about what it does not model. These are the places where
@@ -172,9 +249,11 @@ the metric can change without reflashing.
 sketch.ino        firmware: fusion, control law, OLED, telemetry
 diagram.json      Wokwi wiring
 libraries.txt     Wokwi library manifest
+platformio.ini    local AVR build: `pio run -e megaatmega2560`
 chip/             custom plant: rigid-body dynamics + simulated IMU
 docs/blueprint.md the full design document — maths, register map, milestones
-hardware/         KiCad schematic for the custom PCB (in progress)
+docs/schematic.png v1 schematic as drawn — see "The board" before fabricating
+hardware/         KiCad project, plus power-section.md: the corrected wiring to redraw v1 from
 results/          recorded runs and plots
 ```
 
