@@ -1,6 +1,7 @@
 #include "Wire.h"
 #include "math.h"
-#include "string.h"
+#include <stdint.h>
+#include <string.h>
 #include "Adafruit_GFX.h"
 #include "Adafruit_SSD1306.h"
 
@@ -20,34 +21,63 @@ Adafruit_SSD1306 display(SCREEN_WIDTH, SCREEN_HEIGHT, &Wire, OLED_RESET);
 struct Quat { float w, x, y, z; };
 struct Vec3 { float x, y, z; };
 
-// --- LOW LEVEL OPTIMIZATION: Quake III Fast Inverse Square Root ---
-// Calculates 1.0 / sqrt(x) using bit-level manipulation instead of FPU division.
-// The magic constant lands within ~3.4% ; one Newton-Raphson step takes that to a
-// worst-case relative error of ~1.75e-3.
+// --- Reciprocal square root ---
+// Called twice per control loop: once to normalise the accelerometer vector,
+// once to normalise the estimated quaternion.
 //
-// That is fine for normalising a direction vector, and NOT fine for normalising
-// q_est -- see invSqrtRefined.
-float invSqrt(float x) {
+// Which implementation is faster depends entirely on whether the target has a
+// hardware FPU, so this is decided at compile time rather than assumed:
+//
+//   Arduino Mega (ATmega2560) -- no FPU. Every float operation is a libgcc
+//     call and sqrtf() is a software routine, so trading a square root and a
+//     divide for one shift, one subtract and three multiplies is a genuine
+//     saving. This is the board the Wokwi prototype runs on.
+//
+//   ESP32 (Xtensa LX6) and STM32WBA55 (Cortex-M33F) -- both have a
+//     single-precision FPU. 1.0f/sqrtf(x) is a couple of instructions and
+//     correctly rounded, while the bit trick additionally pays to move the
+//     value between the integer and float register files. On these parts the
+//     "optimisation" is slower AND less accurate.
+//
+// The custom board in hardware/ is the STM32WBA55, so on the hardware this
+// project is actually headed for, the fast path is the plain divide.
+#if defined(__AVR__)
+static inline float invSqrt(float x) {
+  // Bit-level initial guess (Quake III) + one Newton-Raphson step. The magic
+  // constant lands within ~3.4%; one step takes that to a worst-case relative
+  // error of ~1.75e-3. Fine for a direction vector, NOT fine for q_est.
+  //
+  // memcpy rather than *(long*)&y: type-punning through a pointer cast is a
+  // strict-aliasing violation -- undefined behaviour that -O2 is entitled to
+  // miscompile -- and `long` is not 32 bits everywhere. Every compiler in use
+  // turns this memcpy into the same register move.
   float halfx = 0.5f * x;
-  float y = x;
-  // memcpy rather than *(long*)&y: type-punning through a pointer cast is
-  // undefined behaviour, and `long` is not 32 bits everywhere. Both compile to
-  // the same AVR instructions. See the commit message.
   uint32_t i;
-  memcpy(&i, &y, sizeof(i));
+  memcpy(&i, &x, sizeof i);
   i = 0x5f3759dfUL - (i >> 1);
-  memcpy(&y, &i, sizeof(y));
-  y = y * (1.5f - (halfx * y * y));
-  return y;
+  float y;
+  memcpy(&y, &i, sizeof y);
+  return y * (1.5f - halfx * y * y);
 }
 
-// A second Newton-Raphson step. Convergence is quadratic (err' ~ 1.5 * err^2), so
-// ~1.75e-3 becomes ~4.6e-6: about 380x tighter for three multiplies and a
+// A second Newton-Raphson step. Convergence is quadratic (err' ~ 1.5 * err^2),
+// so ~1.75e-3 becomes ~4.6e-6: about 380x tighter for three multiplies and a
 // subtract. Used only for the quaternion, once per loop.
-float invSqrtRefined(float x) {
+static inline float invSqrtRefined(float x) {
   float y = invSqrt(x);
   return y * (1.5f - (0.5f * x * y * y));
 }
+#else
+static inline float invSqrt(float x) {
+  return 1.0f / sqrtf(x);
+}
+
+// On an FPU target invSqrt is already correctly rounded, so there is nothing
+// for a Newton step to refine.
+static inline float invSqrtRefined(float x) {
+  return invSqrt(x);
+}
+#endif
 
 Quat quat_mul(const Quat& q, const Quat& p) {
   return {
@@ -138,6 +168,11 @@ void loop() {
   // The filter mutates `gyro` in place into a corrected rate for the integrator.
   // The PD law's derivative term needs the raw measurement, not that corrected
   // value -- see the note at the control law. Keep a copy before it is touched.
+  //
+  // Quantified: the correction adds Kp_imu * (a x v_est) into `gyro`, which is
+  // estimator feedback, not angular rate. Routing it into the controller feeds
+  // estimator error straight to commanded torque (Kd*Kp_imu = 10.5 against a Kp
+  // of 18) and amplifies accelerometer noise into the actuator by 2.5x.
   const Vec3 gyro_raw = gyro;
 
   float accel_sq = accel.x*accel.x + accel.y*accel.y + accel.z*accel.z;
