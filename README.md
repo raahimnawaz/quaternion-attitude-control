@@ -136,8 +136,9 @@ test. Over 30 s at rest:
 Roll and pitch are inside ±0.0075 rad/s from 3.2 s on. That band is 5σ of the
 estimate's noise, which the linear model puts at 1.5 × 10⁻³ rad/s and the run
 measures at 1.5–1.6 × 10⁻³. Over 20 noise seeds they settle in 2.6–3.3 s, and
-the means land within 0.0004 rad/s of the injected values. CI's Linux `rand()`
-gives 0.0495 and −0.0296, settling at 2.8 s.
+the means land within 0.0004 rad/s of the injected values. Those are macOS's
+`rand()`; on CI's Linux the same sweep gives 2.5–3.2 s and 0.0005 rad/s, and the
+run above gives 0.0495 and −0.0296, settling at 2.8 s.
 
 | last 20 s | estimated vertical off | body off level | heading at 30 s |
 |---|---:|---:|---:|
