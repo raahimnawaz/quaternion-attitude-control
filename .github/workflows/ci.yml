@@ -17,10 +17,12 @@ jobs:
         run: pio run -e megaatmega2560 -e unwinding_demo
       - name: Software-in-the-loop tests
         run: make -C test
-      - name: Unwinding and timing tables
+      - name: Unwinding, timing and gyro-bias tables
         run: |
           test/build/sil --unwind
           test/build/sil --timing
+          test/build/sil --bias
+          test/build/sil --bias-seeds 20
       - name: CPU cycle counts on simavr
         run: |
           pio pkg install -g -t platformio/tool-simavr@1.10800.0

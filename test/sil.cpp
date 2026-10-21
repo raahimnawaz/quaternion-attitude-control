@@ -6,6 +6,7 @@
 //   sil --unwind   path travelled from 181/270/359 deg, naive vs corrected
 //   sil --trace now|naive|baseline START_DEG [out.csv]   per-iteration CSV, 10 s
 //   sil --bias [out.csv]   bias estimate vs the injected value, Ki on and off
+//   sil --bias-seeds N     the same scenario over N noise seeds, plus no-bias floors
 #include <math.h>
 #include <stdio.h>
 #include <string.h>
@@ -433,6 +434,39 @@ static void report_bias(const char *trace) {
   printf("Kp + Ki         %10.2f deg %13.2f deg %14.1f deg\n", res.est_tilt_deg, res.tilt_deg, res.yaw_deg);
 }
 
+static void report_bias_seeds(unsigned n) {
+  printf("Gyro bias over %u noise seeds, %.0f s each; tilt is body/estimate, last %.0f s\n\n", n, bias_run().seconds,
+         TAIL_S);
+  puts("seed  settle s  |mean-b| rad/s  tilt deg     no bias, Ki   no bias, Kp only  yaw est   heading deg");
+  double lo[9], hi[9];
+  for (unsigned seed = 1; seed <= n; seed++) {
+    Run r = bias_run();
+    r.seed = seed;
+    Result a = run(r);
+    Run z;
+    z.seconds = r.seconds;
+    z.seed = seed;
+    Result nb = run(z);
+    z.ki_off = true;
+    Result kp = run(z);
+    const double v[9] = {a.bias_settle_s,
+                         std::max(fabs(a.bias_est[0] - BIAS[0]), fabs(a.bias_est[1] - BIAS[1])),
+                         a.tilt_deg, a.est_tilt_deg, nb.tilt_deg, nb.est_tilt_deg, kp.tilt_deg, kp.est_tilt_deg,
+                         a.bias_est[2]};
+    printf("%4u %9.2f %15.4f %6.2f/%.2f %10.2f/%.2f %12.2f/%.2f %10.4f %11.1f\n", seed, v[0], v[1], v[2], v[3], v[4],
+           v[5], v[6], v[7], v[8], a.yaw_deg);
+    for (int k = 0; k < 9; k++) {
+      lo[k] = seed == 1 ? v[k] : std::min(lo[k], v[k]);
+      hi[k] = seed == 1 ? v[k] : std::max(hi[k], v[k]);
+    }
+  }
+  printf("\nsettle %.2f-%.2f s, |mean-b| <= %.4f rad/s, yaw estimate %.4f to %.4f rad/s\n", lo[0], hi[0], hi[1], lo[8],
+         hi[8]);
+  printf("tilt with bias %.2f-%.2f deg; no bias %.2f-%.2f (Ki), %.2f-%.2f (Kp only)\n",
+         std::min(lo[2], lo[3]), std::max(hi[2], hi[3]), std::min(lo[4], lo[5]), std::max(hi[4], hi[5]),
+         std::min(lo[6], lo[7]), std::max(hi[6], hi[7]));
+}
+
 static void report_unwinding() {
   puts("Path travelled to settle, 10 s from rest (deg)\n");
   puts("start   naive path  corrected path   naive settle s  corrected settle s");
@@ -461,6 +495,7 @@ int main(int argc, char **argv) {
   if (argc > 1 && !strcmp(argv[1], "--timing")) return report_timing(), 0;
   if (argc > 1 && !strcmp(argv[1], "--unwind")) return report_unwinding(), 0;
   if (argc > 1 && !strcmp(argv[1], "--bias")) return report_bias(argc > 2 ? argv[2] : nullptr), 0;
+  if (argc > 2 && !strcmp(argv[1], "--bias-seeds")) return report_bias_seeds(atoi(argv[2])), 0;
   test_bus_clock();
   test_oled_frames();
   test_loop_period();

@@ -31,11 +31,12 @@ still has to close at a usable rate.
 The plant integrates angular velocity with RK4 and attitude with the exponential
 map, which is norm-preserving by construction. The MCU runs a Mahony
 complementary filter to fuse the accelerometer's gravity reference against gyro
-integration, then applies
+integration, with an integral term that estimates the gyro's bias `b̂`, then
+applies
 
 ```
 q_err = q_est⁻¹ ⊗ q_cmd
-τ     = Kp · sign(q_err.w) · q_err.vec  −  Kd · ω
+τ     = Kp · sign(q_err.w) · q_err.vec  −  Kd · (ω_gyro − b̂)
 ```
 
 `sign(q_err.w)` is the unwinding fix. `q` and `−q` are the same rotation, so a
@@ -78,14 +79,14 @@ Both laws start from rest, 359° from the command, and run for 10 s:
 
 | start | naive: path travelled | corrected: path travelled | naive settles (< 2°) | corrected settles |
 |---:|---:|---:|---:|---:|
-| 181° | 194.2° | 192.0° | 2.27 s | 2.30 s |
-| 270° | 284.0° | 99.2° | 2.73 s | 1.96 s |
-| **359°** | **372.1°** | **3.5°** | **5.55 s** | **0 s** |
+| 181° | 193.6° | 192.4° | 2.23 s | 2.32 s |
+| 270° | 283.4° | 100.0° | 2.71 s | 1.99 s |
+| **359°** | **372.5°** | **4.5°** | **5.58 s** | **0 s** |
 
 Path is integrated from the plant's ground truth, so it runs a few degrees past
 the geometric distance (overshoot at ζ = 0.7, plus noise-driven jitter). The
 noise comes from the C library's `rand()`, so the figures move by about a degree
-between platforms: these are macOS, and CI's Linux run gives 373.1° and 3.7° at
+between platforms: these are macOS, and CI's Linux run gives 372.4° and 4.3° at
 359°.
 
 At 359° the body is physically 1° off. The naive controller swings it through
@@ -103,8 +104,9 @@ start from a 5 rad/s tumble, the chip now starts at rest), and they are kept
 only as a record.
 
 The SIL gets to 359° by starting the plant and the estimator together, as if
-the body had been pushed once round. Wokwi has no hook for that yet. The
-blueprint's `0x60` control register is where it would go. The naive build is
+the body had been pushed once round. Wokwi has no hook for that yet. It would
+go in bit 0 (reset) of the blueprint's `0x60` control register, which so far
+implements only bit 2 (bias). The naive build is
 `pio run -e unwinding_demo` (`-DUNWINDING_DEMO=1`).
 
 `sign(q_err.w)` switches discontinuously at 180°, which the literature
@@ -113,6 +115,56 @@ the standard fix is hysteresis. It was checked here and **not** added: from
 exactly 180° the corrected law leaves the 170° band 27 ms later than it does
 from 178°, and settles at the same moment.
 
+### Gyro bias: roll and pitch recovered, yaw not
+
+Setting bit 2 of `0x60` adds a constant bias of `[0.05, −0.03, 0.04]` rad/s to
+the plant's gyro. The filter's integral term estimates it. Its gain is
+`Ki_imu = Kp_imu²/4`, which critically damps the tilt error
+(`s² + Kp_imu·s + Ki_imu`): it was picked from that, not tuned against the
+test. Over 30 s at rest:
+
+| | roll | pitch | yaw |
+|---|---:|---:|---:|
+| estimate at 1 s | 0.021 | −0.010 | 0.000 |
+| at 3 s | 0.041 | −0.025 | 0.000 |
+| at 10 s | 0.051 | −0.029 | 0.000 |
+| **last 20 s, mean ± sd** | **0.0499 ± 0.0015** | **−0.0301 ± 0.0016** | **0.0000** |
+| injected | 0.05 | −0.03 | 0.04 |
+
+*rad/s. SIL, scored against the plant's ground truth.*
+
+Roll and pitch are inside ±0.0075 rad/s from 3.2 s on. That band is 5σ of the
+estimate's noise, which the linear model puts at 1.5 × 10⁻³ rad/s and the run
+measures at 1.5–1.6 × 10⁻³. Over 20 noise seeds they settle in 2.6–3.3 s, and
+the means land within 0.0004 rad/s of the injected values. CI's Linux `rand()`
+gives 0.0495 and −0.0296, settling at 2.8 s.
+
+| last 20 s | estimated vertical off | body off level | heading at 30 s |
+|---|---:|---:|---:|
+| Kp only (before) | 1.31° | 2.87° | −69.0° |
+| Kp + Ki | 0.20° | 0.20° | −69.0° |
+
+0.20° is the accelerometer's noise floor: with no bias at all, the same runs
+give 0.15–0.23° over 20 seeds.
+
+**Yaw is not recovered, and the body turns.** Without a magnetometer, only the
+part of the bias perpendicular to gravity is observable, and with the body
+level that leaves yaw out. The yaw estimate stays at zero, the controller holds
+the *estimate's* heading, and the real body rotates at −b_z: −69.0° in 30 s
+(−b_z·t = −68.8°). Throughout, the estimate reports that it hasn't moved. The
+SIL test asserts this failure along with the recovery, so a change that hides
+it fails the build.
+
+The derivative term uses the gyro minus `b̂`. Without that subtraction the PD
+law holds a standing error of `Kd·b/Kp`: a one-off build without it sat 1.56°
+off level over 20 seeds (modelled: 1.56°). It still never sees the
+`Kp_imu`·residual term. With no bias, the integral term costs 0.05° of body
+jitter against the Kp-only filter (20-seed average), 0.03° of it from this
+subtraction. It also costs ~2,250 cycles a loop (simavr).
+
+`test/build/sil --bias` prints the tables above, and `--bias-seeds 20` prints
+the seed sweep.
+
 ### The control loop was running at 23 Hz
 
 The diagram used to say 400 kHz and 30 Hz. Neither was true:
@@ -120,7 +172,8 @@ The diagram used to say 400 kHz and 30 Hz. Neither was true:
 | | IMU bus | control rate | worst loop period | OLED |
 |---|---:|---:|---:|---:|
 | before (`73c03f0`) | 100 kHz | **22.9 Hz** | **45.3 ms** | 21.9 FPS |
-| after | 400 kHz | **183.8 Hz** | **6.8 ms** | 10.0 FPS |
+| after (`9371b70`) | 400 kHz | **183.8 Hz** | **6.8 ms** | 10.0 FPS |
+| now, with the bias estimator | 400 kHz | 178.8 Hz | 6.9 ms | 9.8 FPS |
 
 *5 s with the stick deflected. CPU measured, bus and ADC modelled, see [Testing](#testing).*
 
@@ -135,7 +188,7 @@ Three things were stacked on top of each other:
    subtraction from the measured UI iteration below). With
    the render and the telemetry, the UI block took longer than its own 33 ms
    timer, so it fired on *every* iteration. The framebuffer now streams two
-   31-byte chunks per loop, ~1.5 ms of bus each time. Frames drop to 10 FPS,
+   31-byte chunks per loop, ~1.5 ms of bus each time. Frames drop to ~10 FPS,
    which is the blueprint's own target for an artificial horizon.
 3. **Telemetry printed floats.** `Serial.print(x, 4)` costs ~9,000 cycles a value
    in soft float, and the line has eight of them. It now formats them as fixed
@@ -150,13 +203,13 @@ Measured on simavr (ATmega2560, 16 MHz), with the bus stubbed out to isolate CPU
 | `sin` / `cos` | 1,950 / 2,013 | 122 / 126 µs |
 | `atan2` / `asin` | 3,108 / 1,308 | 194 / 82 µs |
 | float multiply / divide | 145 / 495 | 9 / 31 µs |
-| one control iteration, now (2 OLED chunks) | 40,221 | 2.5 ms |
-| render iteration, now | 82,545 | 5.2 ms |
-| telemetry iteration, now | 58,452 | 3.7 ms |
+| one control iteration, now (2 OLED chunks) | 42,471 | 2.7 ms |
+| render iteration, now | 83,482 | 5.2 ms |
+| telemetry iteration, now | 60,657 | 3.8 ms |
 | UI iteration, before (render + `display()` + telemetry) | 233,066 | 14.6 ms |
 
 Four trig calls build the command quaternion every loop, about 0.5 ms of the
-2.5. The compiler had already folded `quat_from_euler`'s `yaw = 0` and merged
+2.7. The compiler had already folded `quat_from_euler`'s `yaw = 0` and merged
 the render's repeated `sin(roll)`/`cos(roll)`; hand-hoisting those measured no
 change and was dropped.
 
@@ -170,10 +223,11 @@ to check the model.
   before the read and the early return skipped the integration, so the
   estimator never saw that span. Spinning at 0.5 rad/s in yaw (which gravity
   can't correct) with 10% of reads dropped, the estimate was 11.8° off truth after
-  4 s. With the next good sample integrating across the gap, it's 0.08°.
+  4 s. With the next good sample integrating across the gap, it's 0.20°, which
+  is the noise floor.
 - **The plant latch holds.** The chip snapshots its registers when a transaction
-  opens. In the SIL, 187 of 370 reads have a 1 kHz tick land mid-transfer, and all
-  370 still return one sample. Without the latch 174 would have been spliced
+  opens. In the SIL, 187 of 360 reads have a 1 kHz tick land mid-transfer, and all
+  360 still return one sample. Without the latch 181 would have been spliced
   from two.
 - The torque write still used bare `0x42`/`0x50` after the register names were
   introduced. It now uses `PLANT_ADDR`/`REG_TORQUE`.
@@ -282,10 +336,14 @@ values, the package change, and what to check before ordering.
 The simulation is honest about what it does not model. These are the places where
 these results would not survive contact with hardware:
 
-- **The gyro has no bias.** The plant adds zero-mean noise only. Rejecting slow
-  gyro bias is the main reason a Mahony filter exists, and this sim never asks it
-  to. The `0x60` control register that would inject bias is specified in the
-  blueprint and not implemented.
+- **Yaw bias is unobservable.** There is no magnetometer, so the filter recovers
+  the roll and pitch components of an injected gyro bias but never the yaw
+  component, and the body turns at that rate while the estimate holds still
+  (see above). The bias is also a constant: there's no temperature drift or
+  random walk for the estimator to track.
+- **Nothing in Wokwi turns the bias on.** `0x60` bit 2 works, but the firmware
+  never writes it, so a Wokwi run has an unbiased gyro. Only the SIL sets it.
+  Bits 0, 1 and 3 (reset, freeze, dropout) are still not built.
 - **The accelerometer measures gravity and nothing else.** No linear
   acceleration is modelled, so the classic failure mode — a manoeuvring vehicle
   whose accelerometer stops pointing at the ground — is never exercised. This is
@@ -342,6 +400,7 @@ pio run -e megaatmega2560 -e unwinding_demo   # firmware, both laws; also fetche
 make -C test                                  # SIL tests
 make -C test before-after                     # CPU cycles on simavr + loop-timing table, 73c03f0 vs now
 make -C test plot                             # results/unwinding-359.svg
+test/build/sil --bias                         # gyro-bias estimate vs the injected value, Ki on and off
 ```
 
 CI builds both firmwares and runs the tests and the simavr benchmark on every push.
@@ -366,7 +425,8 @@ What's measured and what's modelled:
 The tests check that IMU traffic runs at 400 kHz, that streamed frames reach the
 OLED's RAM intact (rebuilt from the bytes on the wire), that no loop period
 exceeds 8 ms, the 359° unwinding result, the dropped-read fix, the plant latch,
-and that the fixed-point telemetry matches `Serial.print(x, 4)`.
+that the fixed-point telemetry matches `Serial.print(x, 4)`, and that an
+injected gyro bias is recovered on roll and pitch and not on yaw.
 
 ## Layout
 
