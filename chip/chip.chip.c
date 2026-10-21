@@ -5,22 +5,14 @@
 #include <math.h>
 
 // Register map -- keep in sync with the PLANT_ADDR / REG_* defines in sketch.ino.
-#define REG_WHO_AM_I   0x00 // R,  1  -> 0x51
-#define REG_GYRO       0x10 // R, 12  gyro x,y,z          float32, body frame, rad/s, noise + bias
 #define REG_Q_TRUE     0x30 // R, 16  q_true w,x,y,z      GROUND TRUTH -- scoring only
-#define REG_W_TRUE     0x40 // R, 12  w_true x,y,z        GROUND TRUTH -- scoring only
 #define REG_TORQUE     0x50 // W, 12  torque x,y,z        float32, N.m
-#define REG_CONTROL    0x60 // W,  1  bit2 inject gyro bias (bits 0, 1, 3 not built)
 #define REG_IMU_DATA   0x70 // R, 24  accel x,y,z then gyro x,y,z -- one atomic read
-
-#define WHO_AM_I_VALUE 0x51
-#define CTRL_INJECT_BIAS 0x04
 
 // Everything the master can read, frozen at the instant a read transaction opens.
 // See on_i2c_connect for why this exists.
 typedef struct {
   float q[4];
-  float w[3];
   float accel[3];
   float gyro[3];
 } sensor_snapshot_t;
@@ -34,12 +26,6 @@ typedef struct {
   // Simulated IMU Sensors
   float accel_out[3];
   float gyro_out[3];
-
-  // Constant per-axis offset on the gyro while CTRL_INJECT_BIAS is set. It is
-  // ground truth like q and w: no register serves it, so the firmware has to
-  // estimate it and the host can score the estimate.
-  float gyro_bias[3];
-  uint8_t control;
 
   sensor_snapshot_t snap;
 
@@ -114,12 +100,11 @@ static void on_timer_tick(void *user_data) {
   chip->accel_out[1] = gy + (rand_noise() * accel_noise);
   chip->accel_out[2] = gz + (rand_noise() * accel_noise);
 
-  // 3. Add electrical white noise to the gyroscope, plus the bias if injected
+  // 3. Add electrical white noise to the gyroscope
   float gyro_noise = 0.02f;
-  float bias_on = (chip->control & CTRL_INJECT_BIAS) ? 1.0f : 0.0f;
-  chip->gyro_out[0] = chip->w[0] + bias_on * chip->gyro_bias[0] + (rand_noise() * gyro_noise);
-  chip->gyro_out[1] = chip->w[1] + bias_on * chip->gyro_bias[1] + (rand_noise() * gyro_noise);
-  chip->gyro_out[2] = chip->w[2] + bias_on * chip->gyro_bias[2] + (rand_noise() * gyro_noise);
+  chip->gyro_out[0] = chip->w[0] + (rand_noise() * gyro_noise);
+  chip->gyro_out[1] = chip->w[1] + (rand_noise() * gyro_noise);
+  chip->gyro_out[2] = chip->w[2] + (rand_noise() * gyro_noise);
 }
 
 static bool on_i2c_connect(void *user_data, uint32_t address, bool is_write) {
@@ -144,7 +129,6 @@ static bool on_i2c_connect(void *user_data, uint32_t address, bool is_write) {
   // Latching on both addressings costs one extra memcpy on write transactions and
   // removes the dependency on that behaviour entirely.
   memcpy(chip->snap.q,     chip->q,         sizeof(chip->snap.q));
-  memcpy(chip->snap.w,     chip->w,         sizeof(chip->snap.w));
   memcpy(chip->snap.accel, chip->accel_out, sizeof(chip->snap.accel));
   memcpy(chip->snap.gyro,  chip->gyro_out,  sizeof(chip->snap.gyro));
   return true;
@@ -161,19 +145,10 @@ static uint8_t on_i2c_read(void *user_data) {
   uint8_t data = 0;
   uint8_t reg = chip->current_reg;
 
-  if (reg == REG_WHO_AM_I) {
-    data = WHO_AM_I_VALUE;
-  }
-  else if (reg >= REG_GYRO && reg < REG_GYRO + 12) {
-    data = byte_of(chip->snap.gyro, reg - REG_GYRO);
-  }
-  // Ground truth. The controller must never read these; they exist so the host
+  // Ground truth. The controller must never read this; it exists so the host
   // can score the estimator against the plant.
-  else if (reg >= REG_Q_TRUE && reg < REG_Q_TRUE + 16) {
+  if (reg >= REG_Q_TRUE && reg < REG_Q_TRUE + 16) {
     data = byte_of(chip->snap.q, reg - REG_Q_TRUE);
-  }
-  else if (reg >= REG_W_TRUE && reg < REG_W_TRUE + 12) {
-    data = byte_of(chip->snap.w, reg - REG_W_TRUE);
   }
   // Combined IMU block: accel (12 bytes) then gyro (12 bytes) = 24 bytes total.
   else if (reg >= REG_IMU_DATA && reg < REG_IMU_DATA + 12) {
@@ -194,7 +169,7 @@ static bool on_i2c_write(void *user_data, uint8_t data) {
     chip->buffer_index++;
     return true;
   }
-  if (chip->current_reg == REG_TORQUE || chip->current_reg == REG_CONTROL) {
+  if (chip->current_reg == REG_TORQUE) {
     if (chip->buffer_index - 1 < 12) {
       chip->wire_buffer[chip->buffer_index - 1] = data;
       chip->buffer_index++;
@@ -208,9 +183,6 @@ static void on_i2c_disconnect(void *user_data) {
   if (chip->current_reg == REG_TORQUE && chip->buffer_index == 13) {
     memcpy(chip->tau, chip->wire_buffer, 12);
   }
-  if (chip->current_reg == REG_CONTROL && chip->buffer_index == 2) {
-    chip->control = chip->wire_buffer[0];
-  }
   chip->buffer_index = 0;
 }
 
@@ -221,9 +193,6 @@ void chip_init(void) {
   chip->q[0] = 1.0f; 
   chip->J[0] = 1.0f; chip->J[1] = 2.0f; chip->J[2] = 3.0f; 
   chip->w[0] = 0.0f; chip->w[1] = 0.0f; chip->w[2] = 0.0f;
-  // What 0x60 bit2 switches on: a few deg/s per axis, a different sign and size
-  // on each so a recovered estimate can't match by symmetry.
-  chip->gyro_bias[0] = 0.05f; chip->gyro_bias[1] = -0.03f; chip->gyro_bias[2] = 0.04f;
 
   const i2c_config_t i2c_config = {
     .address = 0x42,

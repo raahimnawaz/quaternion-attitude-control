@@ -10,9 +10,3 @@
 *.md     text eol=lf
 *.json   text eol=lf
 *.txt    text eol=lf
-*.yml    text eol=lf
-
-# The plot is an export with text rendered as paths: a one-line diff is
-# meaningless, so keep it out of diff output and out of language statistics.
-*.svg    text eol=lf -diff
-results/*.svg linguist-generated=true

@@ -10,11 +10,6 @@
 #define OLED_RESET -1
 #define OLED_ADDR 0x3C
 
-// 1 builds the naive law (no sign correction) for the M4 unwinding comparison.
-#ifndef UNWINDING_DEMO
-#define UNWINDING_DEMO 0
-#endif
-
 // The last two arguments are the bus clock during and *after* each display
 // transfer. The library's default "after" is 100 kHz, which silently undid
 // Wire.setClock(400000) for every plant transaction.
@@ -330,11 +325,8 @@ void loop() {
   // --- 4. PD CONTROL LAW ---
   Quat q_est_inv = quat_conj(q_est);
   Quat q_err = quat_mul(q_est_inv, q_cmd);
-#if UNWINDING_DEMO
-  const float sign_w = 1.0f;
-#else
-  float sign_w = (q_err.w >= 0.0f) ? 1.0f : -1.0f; 
-#endif
+  // q and -q are the same attitude: take the short way round.
+  float sign_w = (q_err.w >= 0.0f) ? 1.0f : -1.0f;
 
   // Derivative term uses gyro_raw, not the Mahony-corrected gyro. The corrected
   // value carries Kp_imu * (accelerometer residual), so feeding it here would
