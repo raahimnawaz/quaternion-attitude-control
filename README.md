@@ -63,8 +63,8 @@ Euler angles are computed for the OLED and **never fed back into control**.
 
 ## Results
 
-Every number in this section comes from the software-in-the-loop harness in
-[`test/`](test/): the real `sketch.ino` and `chip/chip.chip.c`, unmodified,
+Apart from the one paragraph that quotes the recorded Wokwi CSVs, the numbers in
+this section come from the software-in-the-loop harness in [`test/`](test/): the real `sketch.ino` and `chip/chip.chip.c`, unmodified,
 built with the real Adafruit libraries on a simulated clock and I²C bus, with
 per-iteration CPU time measured on a cycle-accurate AVR simulator. What that
 does and does not model is spelled out under [Testing](#testing). None of it
@@ -128,7 +128,8 @@ Three things were stacked on top of each other:
    that defaults to 100 kHz, so `Wire.setClock(400000)` in `setup()` was undone
    one line later. The constructor now gets 400 kHz for both.
 2. **`display()` blocked for ~30 ms.** It pushes 1,024 bytes plus headers in one
-   call: ~25 ms of bus at 400 kHz, plus ~5 ms of CPU feeding `Wire.write()`. With
+   call: ~25 ms of bus at 400 kHz, plus ~5 ms of CPU feeding `Wire.write()` (by
+   subtraction from the measured UI iteration below). With
    the render and the telemetry, the UI block took longer than its own 33 ms
    timer, so it fired on *every* iteration. The framebuffer now streams two
    31-byte chunks per loop, ~1.5 ms of bus each time. Frames drop to 10 FPS,
