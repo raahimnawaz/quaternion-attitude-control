@@ -83,7 +83,10 @@ Both laws start from rest, 359° from the command, and run for 10 s:
 | **359°** | **372.1°** | **3.5°** | **5.55 s** | **0 s** |
 
 Path is integrated from the plant's ground truth, so it runs a few degrees past
-the geometric distance (overshoot at ζ = 0.7, plus noise-driven jitter).
+the geometric distance (overshoot at ζ = 0.7, plus noise-driven jitter). The
+noise comes from the C library's `rand()`, so the figures move by about a degree
+between platforms: these are macOS, and CI's Linux run gives 373.1° and 3.7° at
+359°.
 
 At 359° the body is physically 1° off. The naive controller swings it through
 180° of error and all the way round before it settles; the corrected one nudges
