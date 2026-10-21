@@ -5,6 +5,7 @@
 //   sil --timing   loop-timing table, baseline firmware vs now
 //   sil --unwind   path travelled from 181/270/359 deg, naive vs corrected
 //   sil --trace now|naive|baseline START_DEG [out.csv]   per-iteration CSV, 10 s
+//   sil --bias [out.csv]   bias estimate vs the injected value, Ki on and off
 #include <math.h>
 #include <stdio.h>
 #include <string.h>
@@ -31,6 +32,7 @@ struct Run {
   int drop_permille = 0;
   bool inject_bias = false;  // 0x60 bit2, written on the bus after setup()
   float bias[3] = {0, 0, 0};
+  bool ki_off = false;       // Kp-only Mahony, the filter before the integral term
   unsigned seed = 1;
   const char *trace = nullptr;  // per-iteration CSV
 };
@@ -49,9 +51,18 @@ struct Result {
   double tilt_deg;            // true body vs the level command
   double est_tilt_deg;        // estimated vs true vertical
   double yaw_deg;             // true heading at the end (command is 0)
+  double bias_est[3];         // firmware's estimate
+  double bias_sd[3];          // ... and its noise
+  double bias_settle_s;       // last time roll or pitch was off by more than BIAS_TOL
+  float bias_at[7][3];        // estimate at BIAS_AT_S
 };
 
-static constexpr double TAIL_S = 5.0;
+static constexpr double TAIL_S = 20.0;
+// The estimate's noise, linearised: sigma^2 = S Ki^2 / (2 Kp), with S the
+// accelerometer's angle noise (0.05/sqrt(3) rad per sample, every ~5.4 ms):
+// 1.5e-3 rad/s. The band is 5 sigma.
+static constexpr double BIAS_TOL = 0.0075;  // rad/s
+static constexpr double BIAS_AT_S[7] = {0.5, 1, 2, 3, 5, 10, 30};
 
 static double deg(double rad) { return rad * 180.0 / M_PI; }
 
@@ -117,6 +128,7 @@ static Result simulate(const Run &r) {
   const float q0[4] = {(float)cos(h), (float)sin(h), 0, 0};
   plant_set_state(sim::plant, q0, r.w0);
   memcpy(fw.q_est, q0, sizeof q0);
+  if (r.ki_off) *fw.ki = 0;
   sim::drop_permille = r.drop_permille;
   sim::block_torque = r.free_spin;
   if (r.inject_bias) {
@@ -134,7 +146,10 @@ static Result simulate(const Run &r) {
   uint32_t n_tail = 0;
   static const double level[3] = {0, 0, 1};
   FILE *trace = r.trace ? fopen(r.trace, "w") : nullptr;
-  if (trace) fputs("t_s,err_deg,path_deg,est_err_deg,qw,qx,qy,qz,wx,wy,wz\n", trace);
+  if (trace) fputs("t_s,err_deg,path_deg,est_err_deg,qw,qx,qy,qz,wx,wy,wz,bias_x,bias_y,bias_z\n", trace);
+  const float no_bias[3] = {NAN, NAN, NAN};
+  const float *bias_est = fw.gyro_bias ? fw.gyro_bias : no_bias;
+  size_t next_at = 0;
   while (sim::now_ns < t1) {
     const uint64_t t_iter = sim::now_ns;
     sim::run_iteration(fw.loop, fw.cpu);
@@ -156,22 +171,30 @@ static Result simulate(const Run &r) {
     plant_live_imu(sim::plant, imu);
     memcpy(gyro, imu + 12, sizeof gyro);
     for (int k = 0; k < 3; k++) res.gyro_offset[k] += gyro[k] - w[k];
+    const double t = (sim::now_ns - t0) / 1e9;
+    if (fabs(bias_est[0] - r.bias[0]) > BIAS_TOL || fabs(bias_est[1] - r.bias[1]) > BIAS_TOL) res.bias_settle_s = t;
+    for (; next_at < 7 && t >= BIAS_AT_S[next_at] - 1e-9; next_at++) memcpy(res.bias_at[next_at], bias_est, 12);
     if (t_iter >= tail_from) {
       double down_true[3], down_est[3];
       down_of(q, down_true);
       down_of(fw.q_est, down_est);
       res.tilt_deg += angle_between_vec(down_true, level);
       res.est_tilt_deg += angle_between_vec(down_true, down_est);
+      for (int k = 0; k < 3; k++) res.bias_est[k] += bias_est[k], res.bias_sd[k] += bias_est[k] * bias_est[k];
       n_tail++;
     }
     if (trace)
-      fprintf(trace, "%.5f,%.4f,%.4f,%.4f,%.6f,%.6f,%.6f,%.6f,%.5f,%.5f,%.5f\n", (sim::now_ns - t0) / 1e9, err,
-              res.path_deg, est, q[0], q[1], q[2], q[3], w[0], w[1], w[2]);
+      fprintf(trace, "%.5f,%.4f,%.4f,%.4f,%.6f,%.6f,%.6f,%.6f,%.5f,%.5f,%.5f,%.5f,%.5f,%.5f\n", t, err,
+              res.path_deg, est, q[0], q[1], q[2], q[3], w[0], w[1], w[2], bias_est[0], bias_est[1], bias_est[2]);
   }
   if (trace) fclose(trace);
   for (int k = 0; k < 3; k++) res.gyro_offset[k] /= res.iters;
   res.tilt_deg /= n_tail;
   res.est_tilt_deg /= n_tail;
+  for (int k = 0; k < 3; k++) {
+    res.bias_est[k] /= n_tail;
+    res.bias_sd[k] = sqrt(std::max(0.0, res.bias_sd[k] / n_tail - res.bias_est[k] * res.bias_est[k]));
+  }
   res.yaw_deg = deg(2.0 * atan2(q_prev[3], q_prev[0]));
 
   std::vector<double> periods;
@@ -337,19 +360,42 @@ static void test_telemetry() {
 // yaw bias is not (no magnetometer).
 static constexpr float BIAS[3] = {0.05f, -0.03f, 0.04f};  // rad/s, the chip's default
 
-static void test_bias_injected() {
-  puts("0x60 bit2 adds the injected bias to the plant's gyro");
+static Run bias_run() {
   Run r;
   r.seconds = 30;
   r.inject_bias = true;
   memcpy(r.bias, BIAS, sizeof BIAS);
+  return r;
+}
+
+static void test_bias_recovered() {
+  puts("The integral term recovers the injected roll/pitch gyro bias; yaw bias is unobservable");
+  Run r = bias_run();
   Result res = run(r);
-  double worst = 0;
-  for (int k = 0; k < 3; k++) worst = std::max(worst, fabs(res.gyro_offset[k] - BIAS[k]));
-  CHECK(worst < 1e-3, "gyro minus true rate averages [%.4f, %.4f, %.4f] rad/s, injected [%.2f, %.2f, %.2f]",
-        res.gyro_offset[0], res.gyro_offset[1], res.gyro_offset[2], BIAS[0], BIAS[1], BIAS[2]);
-  printf("        (last %.0f s: body tilted %.2f deg, estimated vertical %.2f deg off, heading %.1f deg)\n", TAIL_S,
-         res.tilt_deg, res.est_tilt_deg, res.yaw_deg);
+  r.ki_off = true;
+  Result kp = run(r);
+  double plant_err = 0;
+  for (int k = 0; k < 3; k++) plant_err = std::max(plant_err, fabs(res.gyro_offset[k] - BIAS[k]));
+  CHECK(plant_err < 1e-3, "0x60 bit2: plant gyro minus true rate averages [%.4f, %.4f, %.4f] rad/s",
+        res.gyro_offset[0], res.gyro_offset[1], res.gyro_offset[2]);
+  CHECK(fabs(res.bias_est[0] - BIAS[0]) < 1.5e-3 && fabs(res.bias_est[1] - BIAS[1]) < 1.5e-3,
+        "roll/pitch estimate [%.4f, %.4f] +/- [%.4f, %.4f] rad/s over the last %.0f s, injected [%.2f, %.2f]",
+        res.bias_est[0], res.bias_est[1], res.bias_sd[0], res.bias_sd[1], TAIL_S, BIAS[0], BIAS[1]);
+  CHECK(res.bias_settle_s < 5, "within %.4f rad/s from %.2f s on, and for the rest of %.0f s", BIAS_TOL,
+        res.bias_settle_s, r.seconds);
+  // With no bias at all these are 0.15-0.23 deg over 20 seeds: the accelerometer's noise floor.
+  CHECK(res.est_tilt_deg < 0.3 && res.tilt_deg < 0.3,
+        "estimated vertical %.2f deg off, body %.2f deg off level (Kp only: %.2f, %.2f)", res.est_tilt_deg,
+        res.tilt_deg, kp.est_tilt_deg, kp.tilt_deg);
+  // The honest failure. Level, body z is the gravity axis, so the residual
+  // a x g_est has no z component to integrate: the yaw estimate stays near 0,
+  // the PD law holds the *estimate's* heading, and the body turns at -b_z.
+  CHECK(fabs(res.bias_est[2]) < 0.1 * BIAS[2], "yaw NOT recovered: estimate %.4f rad/s, injected %.2f",
+        res.bias_est[2], BIAS[2]);
+  const double drift = -deg(BIAS[2] * r.seconds);
+  CHECK(fabs(res.yaw_deg - drift) < 0.1 * fabs(drift),
+        "yaw drifts: heading %.1f deg after %.0f s (-b_z t = %.1f), estimate %.1f deg off truth", res.yaw_deg,
+        r.seconds, drift, res.est_err_final_deg);
 }
 
 static void report_timing() {
@@ -365,6 +411,26 @@ static void report_timing() {
            s.period_p99_us, s.period_max_us, 1e6 / s.period_mean_us, s.fps, 100 * s.oled_busy,
            100 * s.imu_busy);
   }
+}
+
+static void report_bias(const char *trace) {
+  Run r = bias_run();
+  printf("Gyro bias estimate, %.0f s at rest, injected [%.2f, %.2f, %.2f] rad/s\n\n", r.seconds, BIAS[0], BIAS[1],
+         BIAS[2]);
+  r.trace = trace;
+  Result res = run(r);
+  r.trace = nullptr;
+  r.ki_off = true;
+  Result kp = run(r);
+  puts("  t s     roll     pitch      yaw");
+  for (int i = 0; i < 7; i++)
+    printf("%5.1f %8.4f %9.4f %8.4f\n", BIAS_AT_S[i], res.bias_at[i][0], res.bias_at[i][1], res.bias_at[i][2]);
+  printf("last %.0f s %6.4f %9.4f %8.4f  mean\n", TAIL_S, res.bias_est[0], res.bias_est[1], res.bias_est[2]);
+  printf("%15.4f %9.4f %8.4f  sd\n", res.bias_sd[0], res.bias_sd[1], res.bias_sd[2]);
+  printf("\nroll/pitch within %.4f rad/s from %.2f s on\n", BIAS_TOL, res.bias_settle_s);
+  printf("\nlast %.0f s       est. vertical off   body off level   heading at %.0f s\n", TAIL_S, r.seconds);
+  printf("Kp only         %10.2f deg %13.2f deg %14.1f deg\n", kp.est_tilt_deg, kp.tilt_deg, kp.yaw_deg);
+  printf("Kp + Ki         %10.2f deg %13.2f deg %14.1f deg\n", res.est_tilt_deg, res.tilt_deg, res.yaw_deg);
 }
 
 static void report_unwinding() {
@@ -394,6 +460,7 @@ int main(int argc, char **argv) {
   }
   if (argc > 1 && !strcmp(argv[1], "--timing")) return report_timing(), 0;
   if (argc > 1 && !strcmp(argv[1], "--unwind")) return report_unwinding(), 0;
+  if (argc > 1 && !strcmp(argv[1], "--bias")) return report_bias(argc > 2 ? argv[2] : nullptr), 0;
   test_bus_clock();
   test_oled_frames();
   test_loop_period();
@@ -401,7 +468,7 @@ int main(int argc, char **argv) {
   test_dropped_reads();
   test_consistent_bursts();
   test_telemetry();
-  test_bias_injected();
+  test_bias_recovered();
   printf("\n%s\n", failures ? "FAILED" : "all passed");
   return failures ? 1 : 0;
 }

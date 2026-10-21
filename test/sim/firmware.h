@@ -8,6 +8,8 @@ struct Firmware {
   void (*setup)();
   void (*loop)();
   float *q_est;  // w, x, y, z
+  float *gyro_bias;  // x, y, z; null where the firmware has none
+  float *ki;
   uint8_t *(*framebuffer)();
   void (*print_fixed4)(float);  // null where the firmware has none
   sim::CpuCycles cpu;

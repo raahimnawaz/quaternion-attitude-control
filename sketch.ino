@@ -119,6 +119,14 @@ uint32_t last_telemetry_millis = 0;
 uint32_t max_dt_us = 0;
 float Kp_imu = 2.5f; 
 
+// Mahony integral term: the estimate of the gyro's bias, rad/s, same sign as the
+// bias. Linearised, the tilt error obeys s^2 + Kp_imu s + Ki_imu = 0, and
+// Ki_imu = Kp_imu^2 / 4 makes that critically damped: a double pole at 1.25 rad/s.
+// Without a magnetometer only the bias component perpendicular to gravity is
+// observable: level, that is roll and pitch, and yaw is never estimated.
+Vec3 gyro_bias = {0.0f, 0.0f, 0.0f};
+float Ki_imu = 1.5625f;
+
 // --- OLED streaming ---
 // One display() is 1024 bytes plus headers: ~25 ms of bus at 400 kHz, during
 // which the loop is stalled. Instead the framebuffer goes out two Wire-buffer
@@ -246,7 +254,8 @@ void loop() {
   float dt = dt_us / 1000000.0f;
 
   // --- 2. MAHONY SENSOR FUSION FILTER (Optimized) ---
-  // The filter mutates `gyro` in place into a corrected rate for the integrator.
+  // The filter mutates `gyro` in place into a corrected rate for the integrator:
+  // less the bias estimate, plus Kp_imu * (accelerometer residual).
   // The PD law's derivative term needs the raw measurement, not that corrected
   // value -- see the note at the control law. Keep a copy before it is touched.
   //
@@ -276,10 +285,18 @@ void loop() {
       accel.x * g_est.y - accel.y * g_est.x
     };
 
+    float ki_dt = Ki_imu * dt;
+    gyro_bias.x -= ki_dt * error.x;
+    gyro_bias.y -= ki_dt * error.y;
+    gyro_bias.z -= ki_dt * error.z;
+
     gyro.x += Kp_imu * error.x;
     gyro.y += Kp_imu * error.y;
     gyro.z += Kp_imu * error.z;
   }
+  gyro.x -= gyro_bias.x;
+  gyro.y -= gyro_bias.y;
+  gyro.z -= gyro_bias.z;
 
   // Integrate
   Quat q_dot = {
@@ -323,10 +340,12 @@ void loop() {
   // Derivative term uses gyro_raw, not the Mahony-corrected gyro. The corrected
   // value carries Kp_imu * (accelerometer residual), so feeding it here would
   // multiply accelerometer noise by Kp_imu * Kd straight into the torque command.
+  // It does subtract the bias estimate: that is integrated, so nearly noise-free,
+  // and without it the law holds a standing error of Kd * bias / Kp.
   Vec3 tau;
-  tau.x = (Kp_base[0] * gain_multiplier) * sign_w * q_err.x - (Kd_base[0] * gain_multiplier) * gyro_raw.x;
-  tau.y = (Kp_base[1] * gain_multiplier) * sign_w * q_err.y - (Kd_base[1] * gain_multiplier) * gyro_raw.y;
-  tau.z = (Kp_base[2] * gain_multiplier) * sign_w * q_err.z - (Kd_base[2] * gain_multiplier) * gyro_raw.z;
+  tau.x = (Kp_base[0] * gain_multiplier) * sign_w * q_err.x - (Kd_base[0] * gain_multiplier) * (gyro_raw.x - gyro_bias.x);
+  tau.y = (Kp_base[1] * gain_multiplier) * sign_w * q_err.y - (Kd_base[1] * gain_multiplier) * (gyro_raw.y - gyro_bias.y);
+  tau.z = (Kp_base[2] * gain_multiplier) * sign_w * q_err.z - (Kd_base[2] * gain_multiplier) * (gyro_raw.z - gyro_bias.z);
 
   Wire.beginTransmission(PLANT_ADDR);
   Wire.write(REG_TORQUE);
