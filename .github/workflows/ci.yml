@@ -1,0 +1,27 @@
+name: ci
+
+on: [push, pull_request]
+
+jobs:
+  firmware-and-sil:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0  # the SIL also builds the baseline sketch from history
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install platformio
+      - name: Build firmware (corrected and naive laws)
+        run: pio run -e megaatmega2560 -e unwinding_demo
+      - name: Software-in-the-loop tests
+        run: make -C test
+      - name: Unwinding and timing tables
+        run: |
+          test/build/sil --unwind
+          test/build/sil --timing
+      - name: CPU cycle counts on simavr
+        run: |
+          pio pkg install -g -t platformio/tool-simavr@1.10800.0
+          make -s -C test avr-bench

@@ -22,7 +22,7 @@ still has to close at a usable rate.
   │        ↓                   │               │                              │
   │ PD law on quaternion error │──── τ ───────►│ Noisy accel + gyro out       │
   │        ↓                   │               │ q_true (scoring only)        │
-  │ OLED horizon @ 30 Hz       │               └──────────────────────────────┘
+  │ OLED horizon, streamed     │               └──────────────────────────────┘
   └────────────────────────────┘
      joystick → attitude command
      pot      → gain multiplier
@@ -63,38 +63,116 @@ Euler angles are computed for the OLED and **never fed back into control**.
 
 ## Results
 
-Both runs start from the same tumble: `ω = [0.01, 5.0, 0.0]` rad/s with the
-commanded attitude just under 180° away, which is precisely the case that
-separates a controller that unwinds from one that does not.
+Every number in this section comes from the software-in-the-loop harness in
+[`test/`](test/): the real `sketch.ino` and `chip/chip.chip.c`, unmodified,
+built with the real Adafruit libraries on a simulated clock and I²C bus, with
+per-iteration CPU time measured on a cycle-accurate AVR simulator. What that
+does and does not model is spelled out under [Testing](#testing). None of it
+has been re-run in Wokwi yet.
 
-| | Naive | With `sign(q_err.w)` |
-|---|---|---|
-| Initial error | 180.91° | 179.09° |
-| Final error | 1.24° | 0.00° |
-| Time to <5° | ~2148 ms | ~2153 ms |
-| Mean loop time | 2000 µs (500 Hz) | 2041 µs (490 Hz) |
+### Unwinding: the naive law goes the long way round
 
-**Read that table carefully, because it does not say what it looks like it says.**
+Both laws start from rest, 359° from the command, and run for 10 s:
 
-The two initial errors are the same physical attitude: 360 − 180.91 = 179.09. The
-naive controller measures its error the long way around and commits to rotating
-through it; the corrected one takes the short path. That difference is real and
-it is visible in the trajectory plots.
+![Attitude error from a 359° start, naive vs sign-corrected](results/unwinding-359.svg)
 
-What the data does **not** show is the corrected controller settling faster. Both
-reach <5° within about 2.15 s, and the corrected one runs marginally slower per
-loop. The honest summary is that on this run the unwinding fix improved the
-*path* and the *final tracking error*, not the settling time.
+| start | naive: path travelled | corrected: path travelled | naive settles (< 2°) | corrected settles |
+|---:|---:|---:|---:|---:|
+| 181° | 194.2° | 192.0° | 2.27 s | 2.30 s |
+| 270° | 284.0° | 99.2° | 2.73 s | 1.96 s |
+| **359°** | **372.1°** | **3.5°** | **5.55 s** | **0 s** |
 
-That comparison is also weaker than it should be: the naive run ends at 2736 ms,
-barely after its own settling point, while the corrected run continues to
-5727 ms. The runs are not length-matched, so the naive settling figure rests on
-almost its last sample. Regenerating both over a common window is outstanding
-work, not a completed result.
+Path is integrated from the plant's ground truth, so it runs a few degrees past
+the geometric distance (overshoot at ζ = 0.7, plus noise-driven jitter).
 
-![Attitude error over time](results/error-vs-time.svg)
+At 359° the body is physically 1° off. The naive controller swings it through
+180° of error and all the way round before it settles; the corrected one nudges
+it 1°. At 181° the two are indistinguishable, because the long way is 181° and
+the short way 179°. A 2° difference is inside the noise.
 
-![Quaternion components over time](results/quaternion-vs-time.svg)
+That is why the recorded Wokwi runs in [`results/`](results/) never showed the
+effect: they were taken at 181°. Their starting errors, 180.91° and 179.09°,
+are one attitude measured two ways. Over the window both runs cover (to 2.74 s)
+they travel **238.9° naive and 237.4° corrected**, and their different final
+errors (1.24° vs 0.00°) are run length: the naive run stopped at 2.7 s, the
+corrected one ran to 5.7 s. Those CSVs also predate the current plant (they
+start from a 5 rad/s tumble, the chip now starts at rest), and they are kept
+only as a record.
+
+The SIL gets to 359° by starting the plant and the estimator together, as if
+the body had been pushed once round. Wokwi has no hook for that yet. The
+blueprint's `0x60` control register is where it would go. The naive build is
+`pio run -e unwinding_demo` (`-DUNWINDING_DEMO=1`).
+
+`sign(q_err.w)` switches discontinuously at 180°, which the literature
+(Mayhew, Sanfelice & Teel, 2011) shows can chatter under measurement noise, and
+the standard fix is hysteresis. It was checked here and **not** added: from
+exactly 180° the corrected law leaves the 170° band 27 ms later than it does
+from 178°, and settles at the same moment.
+
+### The control loop was running at 23 Hz
+
+The diagram used to say 400 kHz and 30 Hz. Neither was true:
+
+| | IMU bus | control rate | worst loop period | OLED |
+|---|---:|---:|---:|---:|
+| before (`73c03f0`) | 100 kHz | **22.9 Hz** | **45.3 ms** | 21.9 FPS |
+| after | 400 kHz | **183.8 Hz** | **6.8 ms** | 10.0 FPS |
+
+*5 s with the stick deflected. CPU measured, bus and ADC modelled, see [Testing](#testing).*
+
+Three things were stacked on top of each other:
+
+1. **`display.begin()` reset the bus to 100 kHz.** Adafruit_SSD1306 restores the
+   I²C clock to its `clkAfter` constructor argument after every transfer, and
+   that defaults to 100 kHz, so `Wire.setClock(400000)` in `setup()` was undone
+   one line later. The constructor now gets 400 kHz for both.
+2. **`display()` blocked for ~30 ms.** It pushes 1,024 bytes plus headers in one
+   call: ~25 ms of bus at 400 kHz, plus ~5 ms of CPU feeding `Wire.write()`. With
+   the render and the telemetry, the UI block took longer than its own 33 ms
+   timer, so it fired on *every* iteration. The framebuffer now streams two
+   31-byte chunks per loop, ~1.5 ms of bus each time. Frames drop to 10 FPS,
+   which is the blueprint's own target for an artificial horizon.
+3. **Telemetry printed floats.** `Serial.print(x, 4)` costs ~9,000 cycles a value
+   in soft float, and the line has eight of them. It now formats them as fixed
+   point by subtraction: the same text (checked over 20,001 values in
+   [-1, 1]) in a quarter of the cycles. It also never lands in the same
+   iteration as a render, so the two worst cases don't stack.
+
+Measured on simavr (ATmega2560, 16 MHz), with the bus stubbed out to isolate CPU:
+
+| | cycles | time |
+|---|---:|---:|
+| `sin` / `cos` | 1,950 / 2,013 | 122 / 126 µs |
+| `atan2` / `asin` | 3,108 / 1,308 | 194 / 82 µs |
+| float multiply / divide | 145 / 495 | 9 / 31 µs |
+| one control iteration, now (2 OLED chunks) | 40,221 | 2.5 ms |
+| render iteration, now | 82,545 | 5.2 ms |
+| telemetry iteration, now | 58,452 | 3.7 ms |
+| UI iteration, before (render + `display()` + telemetry) | 233,066 | 14.6 ms |
+
+Four trig calls build the command quaternion every loop, about 0.5 ms of the
+2.5. The compiler had already folded `quat_from_euler`'s `yaw = 0` and merged
+the render's repeated `sin(roll)`/`cos(roll)`; hand-hoisting those measured no
+change and was dropped.
+
+The firmware now reports this itself: the ninth telemetry column is the worst
+loop period since the previous line, in µs. Run it in Wokwi and read that column
+to check the model.
+
+### Smaller fixes
+
+- **A dropped IMU read lost its interval's rotation.** `last_micros` advanced
+  before the read and the early return skipped the integration, so the
+  estimator never saw that span. Spinning at 0.5 rad/s in yaw (which gravity
+  can't correct) with 10% of reads dropped, the estimate was 11.8° off truth after
+  4 s. With the next good sample integrating across the gap, it's 0.08°.
+- **The plant latch holds.** The chip snapshots its registers when a transaction
+  opens. In the SIL, 187 of 370 reads have a 1 kHz tick land mid-transfer, and all
+  370 still return one sample. Without the latch 174 would have been spliced
+  from two.
+- The torque write still used bare `0x42`/`0x50` after the register names were
+  introduced. It now uses `PLANT_ADDR`/`REG_TORQUE`.
 
 ### Gains
 
@@ -115,26 +193,29 @@ m = 1. The knob is a damping control wearing a gain control's clothing.
 
 ---
 
-### `invSqrt` only wins on one of the three targets
+### `invSqrt`: a small win on the AVR, and one place it was a loss
 
 The Quake III reciprocal square root is worth having *or* worth deleting
 depending entirely on whether the part has an FPU:
 
 | target | FPU | verdict |
 |---|---|---|
-| **Arduino Mega** (ATmega2560) — the Wokwi prototype | none | **wins.** `sqrtf` is a software routine and every float op is a libgcc call, so trading a root and a divide for a shift, a subtract and three multiplies is a real saving |
-| **ESP32** (Xtensa LX6) | yes | **loses.** `1.0f/sqrtf(x)` is a couple of instructions and correctly rounded; the trick also pays to move between integer and float register files |
-| **STM32WBA55** (Cortex-M33F) — the custom board | yes | **loses**, same reason |
+| **Arduino Mega** (ATmega2560), the Wokwi prototype | none | **wins, slightly:** 730 cycles against 979 for `1.0f/sqrtf` (simavr). That's ~16 µs a loop, 0.3% of the period |
+| **ESP32** (Xtensa LX6) | yes | **should lose.** `1.0f/sqrtf(x)` is a couple of instructions and correctly rounded, and the trick also pays to move between integer and float register files. *Not measured.* |
+| **STM32WBA55** (Cortex-M33F), the custom board | yes | **should lose**, same reason. *Not measured.* |
 
-So the optimisation is right for the board it was prototyped on and wrong for
-the board it is headed to. `sketch.ino` now selects on `__AVR__` rather than
-assuming. The AVR path also swaps `*(long*)&y` for `memcpy` — the pointer cast
-is a strict-aliasing violation, undefined behaviour that `-O2` is entitled to
-miscompile, and every compiler lowers the `memcpy` to the same register move.
+`sketch.ino` selects on `__AVR__` rather than assuming, and the AVR path
+type-puns through `memcpy`, not `*(long*)&y`, which is a strict-aliasing
+violation.
 
-**This is still unmeasured.** The number it needs is a `micros()` loop around
-~10,000 calls of each variant on each board; until that exists the table above
-is an architectural argument, not a result.
+One Newton step leaves a relative error of ~1.7e-3. That's fine for the
+accelerometer, whose direction is all that matters, but not for `q_est`, which
+it would leave biased off unit norm every loop. A second Newton step fixes the
+accuracy, but on the AVR it measures **1,250–1,300 cycles (depending on how the
+build inlines it): slower than the 979-cycle library call it was meant to beat**,
+and still less accurate. So the quaternion now uses `1.0f/sqrtf` on every
+target. That takes ~300 cycles off every loop (40,500 → 40,186 per iteration,
+measured) and makes the normalisation exact.
 
 ---
 
@@ -211,13 +292,18 @@ these results would not survive contact with hardware:
   exponential map; the MCU does not, which contradicts §2.4 of the blueprint. It
   is standard Mahony formulation, but the discrepancy is unmeasured.
 - **`dt` is unclamped.** A stalled loop feeds an arbitrarily large step into the
-  integrator.
-- **Results predate the current plant.** The CSVs were recorded when the chip
-  started at a 5 rad/s tumble; the current chip starts at rest. They are not
-  reproducible from a clean checkout without restoring that initial condition.
+  integrator. With the worst period now ~7 ms this only matters if the bus hangs.
+  Clamping would be wrong too, because it throws the rotation away.
+- **The recorded CSVs predate the current plant** (a 5 rad/s tumble start; the
+  chip now starts at rest) and were taken at 181°, where unwinding can't show.
+  The SIL results above replace them.
+- **Nothing here has run on silicon or been re-run in Wokwi.** The SIL's CPU
+  costs are measured, but its bus timing is protocol arithmetic, its ADC is the
+  datasheet figure, and its plant is the same chip code Wokwi runs.
 - **Wokwi does not simulate ADC source impedance**, so the analog input circuit
   is validated only in principle.
-- **No CI.** M9 is unstarted; nothing verifies the quaternion library on push.
+- **The SIL's timing is a model.** See [Testing](#testing) for exactly which
+  parts are measured.
 
 ---
 
@@ -227,11 +313,13 @@ Open the project in [Wokwi](https://wokwi.com) — `diagram.json` and `sketch.in
 must stay in the repository root, which is why the firmware is not tucked into a
 subdirectory. The custom plant builds from `chip/chip.chip.c`.
 
-Telemetry streams over serial at 115200 baud, 8 columns at 30 Hz:
+Telemetry streams over serial at 115200 baud, 9 columns at 30 Hz:
 
 ```
-q_est.w, q_est.x, q_est.y, q_est.z, q_true.w, q_true.x, q_true.y, q_true.z
+q_est.w, q_est.x, q_est.y, q_est.z, q_true.w, q_true.x, q_true.y, q_true.z, max_dt_us
 ```
+
+`max_dt_us` is the worst control-loop period since the previous line.
 
 Attitude error in degrees is `2·acos(|⟨q_est, q_true⟩|)`, computed downstream so
 the metric can change without reflashing.
@@ -243,18 +331,52 @@ the metric can change without reflashing.
 
 ---
 
+## Testing
+
+```bash
+pio run -e megaatmega2560 -e unwinding_demo   # firmware, both laws; also fetches the libraries
+make -C test                                  # SIL tests
+make -C test before-after                     # CPU cycles on simavr + loop-timing table, 73c03f0 vs now
+make -C test plot                             # results/unwinding-359.svg
+```
+
+CI builds both firmwares and runs the tests and the simavr benchmark on every push.
+
+The SIL compiles `sketch.ino` three times into separate namespaces (as is, with
+`UNWINDING_DEMO=1`, and as of `73c03f0` for the before/after), against small
+Arduino, Wire and Wokwi-chip shims. The Adafruit libraries are the real ones, so
+the bus traffic they generate, including the clock reset, comes from their
+code, not from a model of it. Each scenario runs in its own process, scored
+against the plant's ground truth, which the firmware never sees.
+
+What's measured and what's modelled:
+
+| | source |
+|---|---|
+| firmware and plant logic | the real code, unmodified |
+| CPU time per loop iteration | **measured**: cycle counts from simavr (`make -C test avr-bench`) for each kind of iteration, charged to the simulated clock |
+| I²C time | **modelled**: 9 bit-times per byte plus START/STOP, at whatever clock `Wire` was last set to. Leaves out the TWI interrupt's per-byte service time, so it's a floor |
+| `analogRead` | **modelled**: 104 µs, the datasheet's 13 ADC clocks at 16 MHz / 128 (simavr completes it in 26 µs) |
+| plant | `chip/chip.chip.c` on a 1 kHz timer, interleaved with the bus byte by byte |
+
+The tests check that IMU traffic runs at 400 kHz, that streamed frames reach the
+OLED's RAM intact (rebuilt from the bytes on the wire), that no loop period
+exceeds 8 ms, the 359° unwinding result, the dropped-read fix, the plant latch,
+and that the fixed-point telemetry matches `Serial.print(x, 4)`.
+
 ## Layout
 
 ```
 sketch.ino        firmware: fusion, control law, OLED, telemetry
 diagram.json      Wokwi wiring
 libraries.txt     Wokwi library manifest
-platformio.ini    local AVR build: `pio run -e megaatmega2560`
+platformio.ini    local AVR build: `pio run` (and `-e unwinding_demo` for the naive law)
 chip/             custom plant: rigid-body dynamics + simulated IMU
 docs/blueprint.md the full design document — maths, register map, milestones
 docs/schematic.png v1 schematic as drawn — see "The board" before fabricating
 hardware/         KiCad project, plus power-section.md: the corrected wiring to redraw v1 from
 results/          recorded runs and plots
+test/             software-in-the-loop harness and the simavr cycle benchmark
 ```
 
 `docs/blueprint.md` is the primary reference: it derives the maths, fixes the

@@ -8,7 +8,17 @@
 #define SCREEN_WIDTH 128
 #define SCREEN_HEIGHT 64
 #define OLED_RESET -1
-Adafruit_SSD1306 display(SCREEN_WIDTH, SCREEN_HEIGHT, &Wire, OLED_RESET);
+#define OLED_ADDR 0x3C
+
+// 1 builds the naive law (no sign correction) for the M4 unwinding comparison.
+#ifndef UNWINDING_DEMO
+#define UNWINDING_DEMO 0
+#endif
+
+// The last two arguments are the bus clock during and *after* each display
+// transfer. The library's default "after" is 100 kHz, which silently undid
+// Wire.setClock(400000) for every plant transaction.
+Adafruit_SSD1306 display(SCREEN_WIDTH, SCREEN_HEIGHT, &Wire, OLED_RESET, 400000UL, 400000UL);
 
 // Plant register map -- keep in sync with blueprint section 3.1 and chip/chip.chip.c.
 // These were bare hex literals at three call sites, which is how 0x30 came to mean
@@ -22,16 +32,17 @@ struct Quat { float w, x, y, z; };
 struct Vec3 { float x, y, z; };
 
 // --- Reciprocal square root ---
-// Called twice per control loop: once to normalise the accelerometer vector,
-// once to normalise the estimated quaternion.
+// Called once per control loop, to normalise the accelerometer vector -- only
+// its direction matters, so one Newton step is accurate enough.
 //
 // Which implementation is faster depends entirely on whether the target has a
 // hardware FPU, so this is decided at compile time rather than assumed:
 //
 //   Arduino Mega (ATmega2560) -- no FPU. Every float operation is a libgcc
 //     call and sqrtf() is a software routine, so trading a square root and a
-//     divide for one shift, one subtract and three multiplies is a genuine
-//     saving. This is the board the Wokwi prototype runs on.
+//     divide for an integer shift and subtract, four multiplies and a float
+//     subtract is a saving: 730 cycles against 979 (simavr). This is the
+//     board the Wokwi prototype runs on.
 //
 //   ESP32 (Xtensa LX6) and STM32WBA55 (Cortex-M33F) -- both have a
 //     single-precision FPU. 1.0f/sqrtf(x) is a couple of instructions and
@@ -59,23 +70,9 @@ static inline float invSqrt(float x) {
   memcpy(&y, &i, sizeof y);
   return y * (1.5f - halfx * y * y);
 }
-
-// A second Newton-Raphson step. Convergence is quadratic (err' ~ 1.5 * err^2),
-// so ~1.75e-3 becomes ~4.6e-6: about 380x tighter for three multiplies and a
-// subtract. Used only for the quaternion, once per loop.
-static inline float invSqrtRefined(float x) {
-  float y = invSqrt(x);
-  return y * (1.5f - (0.5f * x * y * y));
-}
 #else
 static inline float invSqrt(float x) {
   return 1.0f / sqrtf(x);
-}
-
-// On an FPU target invSqrt is already correctly rounded, so there is nothing
-// for a Newton step to refine.
-static inline float invSqrtRefined(float x) {
-  return invSqrt(x);
 }
 #endif
 
@@ -117,15 +114,93 @@ const float Kd_base[3] = {4.2f,  8.4f,  12.6f};
 // State Estimation Globals
 Quat q_est = {1.0f, 0.0f, 0.0f, 0.0f}; 
 uint32_t last_micros = 0;
-uint32_t last_oled_millis = 0;
+uint32_t last_frame_millis = 0;
+uint32_t last_telemetry_millis = 0;
+uint32_t max_dt_us = 0;
 float Kp_imu = 2.5f; 
+
+// --- OLED streaming ---
+// One display() is 1024 bytes plus headers: ~25 ms of bus at 400 kHz, during
+// which the loop is stalled. Instead the framebuffer goes out two Wire-buffer
+// chunks per control iteration: ~1.5 ms of bus per loop, ~10 FPS.
+const uint16_t OLED_BYTES = SCREEN_WIDTH * SCREEN_HEIGHT / 8;
+const uint8_t OLED_CHUNK = 31;    // 32-byte AVR Wire buffer, less the 0x40 prefix
+const uint8_t OLED_CHUNKS_PER_LOOP = 2;
+uint16_t oled_sent = OLED_BYTES;  // == OLED_BYTES: no frame in flight
+
+void oled_start_frame() {
+  Wire.beginTransmission(OLED_ADDR);
+  Wire.write(0x00);  // command stream
+  Wire.write(SSD1306_PAGEADDR);
+  Wire.write(0);
+  Wire.write(SCREEN_HEIGHT / 8 - 1);
+  Wire.write(SSD1306_COLUMNADDR);
+  Wire.write(0);
+  Wire.write(SCREEN_WIDTH - 1);
+  Wire.endTransmission();
+  oled_sent = 0;
+}
+
+void oled_send_chunk() {
+  uint16_t n = OLED_BYTES - oled_sent;
+  if (n > OLED_CHUNK) n = OLED_CHUNK;
+  Wire.beginTransmission(OLED_ADDR);
+  Wire.write(0x40);  // data stream
+  Wire.write(display.getBuffer() + oled_sent, n);
+  Wire.endTransmission();
+  oled_sent += n;
+}
+
+void render_horizon() {
+  float roll  = atan2(2.0f * (q_est.w * q_est.x + q_est.y * q_est.z), 1.0f - 2.0f * (q_est.x * q_est.x + q_est.y * q_est.y));
+  // The clamp is load-bearing (blueprint 2.7). Float error in the norm pushes
+  // this argument past +/-1 and asin returns NaN, which reaches the display and
+  // reads as a controller failure rather than a numerics failure.
+  float pitch = asin(clampf(2.0f * (q_est.w * q_est.y - q_est.z * q_est.x), -1.0f, 1.0f));
+
+  display.clearDisplay();
+  display.drawFastHLine(64 - 15, 32, 10, SSD1306_WHITE); 
+  display.drawFastHLine(64 + 5,  32, 10, SSD1306_WHITE); 
+  display.drawPixel(64, 32, SSD1306_WHITE);              
+
+  float pixels_per_rad = 40.0f; 
+  float pitch_offset = pitch * pixels_per_rad;
+  
+  int r = 100; 
+  int x0 = 64 - r * cos(roll);
+  int y0 = 32 + pitch_offset + r * sin(roll);
+  int x1 = 64 + r * cos(roll);
+  int y1 = 32 + pitch_offset - r * sin(roll);
+
+  display.drawLine(x0, y0, x1, y1, SSD1306_WHITE);
+}
+
+// Serial.print(float, 4) costs ~8,800 cycles a value in soft float. Quaternion
+// components are in [-1, 1], so format them as fixed point: same text, a
+// fraction of the cost.
+void print_fixed4(float v) {
+  static const int16_t place[4] = {1000, 100, 10, 1};
+  int16_t n = lround(v * 10000.0f);
+  char s[8], *p = s;
+  if (n < 0) { *p++ = '-'; n = -n; }
+  *p++ = n >= 10000 ? '1' : '0';
+  if (n >= 10000) n -= 10000;
+  *p++ = '.';
+  for (uint8_t k = 0; k < 4; k++) {  // digits by subtraction: no 16-bit divides
+    char c = '0';
+    while (n >= place[k]) { n -= place[k]; c++; }
+    *p++ = c;
+  }
+  *p = 0;
+  Serial.print(s);
+}
 
 void setup() {
   Serial.begin(115200);
   Wire.begin();
   Wire.setClock(400000); 
   
-  if(!display.begin(SSD1306_SWITCHCAPVCC, 0x3C)) {
+  if(!display.begin(SSD1306_SWITCHCAPVCC, OLED_ADDR)) {
     Serial.println(F("SSD1306 allocation failed"));
     for(;;);
   }
@@ -139,13 +214,12 @@ void setup() {
   delay(100); 
   
   last_micros = micros();
-  last_oled_millis = millis();
+  last_frame_millis = millis();
+  last_telemetry_millis = millis();
 }
 
 void loop() {
   uint32_t now = micros();
-  float dt = (now - last_micros) / 1000000.0f;
-  last_micros = now;
 
   // --- 1. SENSOR READING (Raw IMU Data) ---
   // One transaction for both sensors. Two transactions would sample two different
@@ -160,9 +234,16 @@ void loop() {
     Wire.readBytes((uint8_t*)&gyro, 12);
   } else {
     // Short read: readBytes would time out and leave accel/gyro partly filled with
-    // stack garbage, which then gets integrated. Skip this cycle instead.
+    // stack garbage, which then gets integrated. Skip this cycle instead -- and
+    // leave last_micros alone, so the next good sample integrates across the
+    // whole gap rather than the estimator silently losing its rotation.
     return;
   }
+
+  uint32_t dt_us = now - last_micros;
+  last_micros = now;
+  if (dt_us > max_dt_us) max_dt_us = dt_us;
+  float dt = dt_us / 1000000.0f;
 
   // --- 2. MAHONY SENSOR FUSION FILTER (Optimized) ---
   // The filter mutates `gyro` in place into a corrected rate for the integrator.
@@ -213,10 +294,11 @@ void loop() {
   q_est.y += q_dot.y * dt;
   q_est.z += q_dot.z * dt;
 
-  // Fast quaternion normalization -- refined, because this error is the one that
-  // compounds and the one that reaches asin(). Once per loop, so the extra
-  // Newton step is the cheapest accuracy in the sketch.
-  float q_norm_inv = invSqrtRefined(q_est.w*q_est.w + q_est.x*q_est.x + q_est.y*q_est.y + q_est.z*q_est.z);
+  // Quaternion normalization -- the plain library call, on every target. One
+  // Newton step leaves |q| biased by ~1.7e-3, the error that compounds and
+  // reaches asin(); a second step fixes that but measures 1,250-1,300 cycles
+  // against 979 for the correctly rounded 1/sqrtf (simavr, ATmega2560).
+  float q_norm_inv = 1.0f / sqrtf(q_est.w*q_est.w + q_est.x*q_est.x + q_est.y*q_est.y + q_est.z*q_est.z);
   q_est.w *= q_norm_inv; 
   q_est.x *= q_norm_inv; 
   q_est.y *= q_norm_inv; 
@@ -232,7 +314,11 @@ void loop() {
   // --- 4. PD CONTROL LAW ---
   Quat q_est_inv = quat_conj(q_est);
   Quat q_err = quat_mul(q_est_inv, q_cmd);
+#if UNWINDING_DEMO
+  const float sign_w = 1.0f;
+#else
   float sign_w = (q_err.w >= 0.0f) ? 1.0f : -1.0f; 
+#endif
 
   // Derivative term uses gyro_raw, not the Mahony-corrected gyro. The corrected
   // value carries Kp_imu * (accelerometer residual), so feeding it here would
@@ -242,39 +328,26 @@ void loop() {
   tau.y = (Kp_base[1] * gain_multiplier) * sign_w * q_err.y - (Kd_base[1] * gain_multiplier) * gyro_raw.y;
   tau.z = (Kp_base[2] * gain_multiplier) * sign_w * q_err.z - (Kd_base[2] * gain_multiplier) * gyro_raw.z;
 
-  Wire.beginTransmission(0x42);
-  Wire.write(0x50);
+  Wire.beginTransmission(PLANT_ADDR);
+  Wire.write(REG_TORQUE);
   Wire.write((uint8_t*)&tau, 12);
   Wire.endTransmission();
 
-  // --- 5. UI LOOP (Decoupled at ~30 FPS) ---
-  // The UI no longer blocks the physics calculations
-  if (millis() - last_oled_millis >= 33) {
-    last_oled_millis = millis();
-    
-    float roll  = atan2(2.0f * (q_est.w * q_est.x + q_est.y * q_est.z), 1.0f - 2.0f * (q_est.x * q_est.x + q_est.y * q_est.y));
-    // The clamp is load-bearing (blueprint 2.7). Float error in the norm pushes
-    // this argument past +/-1 and asin returns NaN, which reaches the display and
-    // reads as a controller failure rather than a numerics failure.
-    float pitch = asin(clampf(2.0f * (q_est.w * q_est.y - q_est.z * q_est.x), -1.0f, 1.0f));
+  // --- 5. UI: stream the framebuffer, new frame every >= 33 ms ---
+  bool rendered = false;
+  if (oled_sent < OLED_BYTES) {
+    for (uint8_t i = 0; i < OLED_CHUNKS_PER_LOOP && oled_sent < OLED_BYTES; i++) oled_send_chunk();
+  } else if (millis() - last_frame_millis >= 33) {
+    last_frame_millis = millis();
+    render_horizon();
+    oled_start_frame();
+    rendered = true;
+  }
 
-    display.clearDisplay();
-    display.drawFastHLine(64 - 15, 32, 10, SSD1306_WHITE); 
-    display.drawFastHLine(64 + 5,  32, 10, SSD1306_WHITE); 
-    display.drawPixel(64, 32, SSD1306_WHITE);              
+  // --- 6. TELEMETRY, ~30 Hz, never in the same iteration as a render ---
+  if (!rendered && millis() - last_telemetry_millis >= 33) {
+    last_telemetry_millis = millis();
 
-    float pixels_per_rad = 40.0f; 
-    float pitch_offset = pitch * pixels_per_rad;
-    
-    int r = 100; 
-    int x0 = 64 - r * cos(roll);
-    int y0 = 32 + pitch_offset + r * sin(roll);
-    int x1 = 64 + r * cos(roll);
-    int y1 = 32 + pitch_offset - r * sin(roll);
-
-    display.drawLine(x0, y0, x1, y1, SSD1306_WHITE);
-    display.display();
-    
     // --- GROUND TRUTH: SCORING ONLY ---
     // Read here, inside the telemetry block, and never above it. By the time this
     // runs the torque command has already gone out, and q_true lives in a local
@@ -296,20 +369,24 @@ void loop() {
     }
 
     // Telemetry for the Python dashboard.
-    // Columns: q_est.w,q_est.x,q_est.y,q_est.z,q_true.w,q_true.x,q_true.y,q_true.z
+    // Columns: q_est.w,q_est.x,q_est.y,q_est.z,q_true.w,q_true.x,q_true.y,q_true.z,max_dt_us
     // Raw quaternions rather than a precomputed error angle -- the scoring metric
     // should be changeable without reflashing, and the MCU has better things to do.
-    Serial.print(q_est.w, 4); Serial.print(",");
-    Serial.print(q_est.x, 4); Serial.print(",");
-    Serial.print(q_est.y, 4); Serial.print(",");
-    Serial.print(q_est.z, 4); Serial.print(",");
+    // max_dt_us is the worst loop period since the previous line.
+    print_fixed4(q_est.w); Serial.print(',');
+    print_fixed4(q_est.x); Serial.print(',');
+    print_fixed4(q_est.y); Serial.print(',');
+    print_fixed4(q_est.z); Serial.print(',');
     if (truth_ok) {
-      Serial.print(q_true.w, 4); Serial.print(",");
-      Serial.print(q_true.x, 4); Serial.print(",");
-      Serial.print(q_true.y, 4); Serial.print(",");
-      Serial.println(q_true.z, 4);
+      print_fixed4(q_true.w); Serial.print(',');
+      print_fixed4(q_true.x); Serial.print(',');
+      print_fixed4(q_true.y); Serial.print(',');
+      print_fixed4(q_true.z);
     } else {
-      Serial.println("nan,nan,nan,nan");
+      Serial.print("nan,nan,nan,nan");
     }
+    Serial.print(',');
+    Serial.println(max_dt_us);
+    max_dt_us = 0;
   }
 }
