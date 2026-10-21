@@ -4,7 +4,7 @@
 #include <string.h>
 #include <math.h>
 
-// Register map -- keep in sync with blueprint section 3.1.
+// Register map -- keep in sync with the PLANT_ADDR / REG_* defines in sketch.ino.
 #define REG_WHO_AM_I   0x00 // R,  1  -> 0x51
 #define REG_GYRO       0x10 // R, 12  gyro x,y,z          float32, body frame, rad/s, noise + bias
 #define REG_Q_TRUE     0x30 // R, 16  q_true w,x,y,z      GROUND TRUTH -- scoring only
@@ -129,9 +129,9 @@ static bool on_i2c_connect(void *user_data, uint32_t address, bool is_write) {
   // The plant advances every 1 ms. A 24-byte read at 400 kHz occupies the bus for
   // roughly 600 us, so on_timer_tick WILL fire partway through one and the master
   // ends up with the first few bytes from step N and the rest from step N+1.
-  // For a quaternion that means a non-unit result assembled from two instants
-  // (blueprint trap 6.3); for accel-vs-gyro it means a fusion filter comparing
-  // measurements that never coexisted.
+  // For a quaternion that means a non-unit result assembled from two instants;
+  // for accel-vs-gyro it means a fusion filter comparing measurements that never
+  // coexisted.
   //
   // Latching the whole readable state here makes every transaction atomic with
   // respect to the physics tick.
@@ -151,7 +151,7 @@ static bool on_i2c_connect(void *user_data, uint32_t address, bool is_write) {
 }
 
 // Little-endian float32 on the wire; AVR and WASM agree, so a raw byte view is
-// the whole serialisation. Blueprint section 1.
+// the whole serialisation.
 static uint8_t byte_of(const float *src, uint8_t offset) {
   return ((const uint8_t *)src)[offset];
 }
@@ -167,8 +167,8 @@ static uint8_t on_i2c_read(void *user_data) {
   else if (reg >= REG_GYRO && reg < REG_GYRO + 12) {
     data = byte_of(chip->snap.gyro, reg - REG_GYRO);
   }
-  // Ground truth. The controller must never read these -- see blueprint M7 and
-  // trap 6.6. They exist so the host can score the estimator against the plant.
+  // Ground truth. The controller must never read these; they exist so the host
+  // can score the estimator against the plant.
   else if (reg >= REG_Q_TRUE && reg < REG_Q_TRUE + 16) {
     data = byte_of(chip->snap.q, reg - REG_Q_TRUE);
   }

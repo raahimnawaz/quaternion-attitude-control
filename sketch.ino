@@ -20,7 +20,7 @@
 // Wire.setClock(400000) for every plant transaction.
 Adafruit_SSD1306 display(SCREEN_WIDTH, SCREEN_HEIGHT, &Wire, OLED_RESET, 400000UL, 400000UL);
 
-// Plant register map -- keep in sync with blueprint section 3.1 and chip/chip.chip.c.
+// Plant register map -- keep in sync with chip/chip.chip.c.
 // These were bare hex literals at three call sites, which is how 0x30 came to mean
 // two different things in two different files.
 #define PLANT_ADDR   0x42
@@ -50,8 +50,7 @@ struct Vec3 { float x, y, z; };
 //     value between the integer and float register files. On these parts the
 //     "optimisation" is slower AND less accurate.
 //
-// The custom board in hardware/ is the STM32WBA55, so on the hardware this
-// project is actually headed for, the fast path is the plain divide.
+// So on any FPU target this firmware moves to, the fast path is the plain divide.
 #if defined(__AVR__)
 static inline float invSqrt(float x) {
   // Bit-level initial guess (Quake III) + one Newton-Raphson step. The magic
@@ -161,7 +160,7 @@ void oled_send_chunk() {
 
 void render_horizon() {
   float roll  = atan2(2.0f * (q_est.w * q_est.x + q_est.y * q_est.z), 1.0f - 2.0f * (q_est.x * q_est.x + q_est.y * q_est.y));
-  // The clamp is load-bearing (blueprint 2.7). Float error in the norm pushes
+  // The clamp is load-bearing. Float error in the norm pushes
   // this argument past +/-1 and asin returns NaN, which reaches the display and
   // reads as a controller failure rather than a numerics failure.
   float pitch = asin(clampf(2.0f * (q_est.w * q_est.y - q_est.z * q_est.x), -1.0f, 1.0f));
@@ -231,7 +230,7 @@ void loop() {
 
   // --- 1. SENSOR READING (Raw IMU Data) ---
   // One transaction for both sensors. Two transactions would sample two different
-  // instants of a 1 kHz plant (blueprint trap 6.3); the chip additionally latches
+  // instants of a 1 kHz plant; the chip additionally latches
   // its state on connect so this read is atomic with respect to the physics tick.
   Vec3 accel, gyro;
   Wire.beginTransmission(PLANT_ADDR);
@@ -372,11 +371,11 @@ void loop() {
     // runs the torque command has already gone out, and q_true lives in a local
     // that dies at the end of this scope -- so there is no name the control path
     // could refer to it by even by accident. M7's whole premise is that the
-    // estimator does not get to see truth (trap 6.6), and scope enforces that
+    // estimator does not get to see truth, and scope enforces that
     // better than a comment asking the next person not to.
     //
     // 16 bytes in one transaction. Four separate reads would assemble a
-    // quaternion out of four different instants of a 1 kHz plant (trap 6.3).
+    // quaternion out of four different instants of a 1 kHz plant.
     Quat q_true = {1.0f, 0.0f, 0.0f, 0.0f};
     bool truth_ok = false;
     Wire.beginTransmission(PLANT_ADDR);

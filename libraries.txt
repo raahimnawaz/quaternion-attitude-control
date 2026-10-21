@@ -1,3 +1,2 @@
-Adafruit BMP085 Library
 Adafruit GFX Library
 Adafruit SSD1306

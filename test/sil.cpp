@@ -357,7 +357,7 @@ static void test_telemetry() {
         res.telemetry_lines, res.telemetry_bad);
 }
 
-// Blueprint M7 step 3. Roll/pitch bias is observable from the accelerometer;
+// M7 step 3. Roll/pitch bias is observable from the accelerometer;
 // yaw bias is not (no magnetometer).
 static constexpr float BIAS[3] = {0.05f, -0.03f, 0.04f};  // rad/s, the chip's default
 

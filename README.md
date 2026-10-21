@@ -64,7 +64,7 @@ Euler angles are computed for the OLED and **never fed back into control**.
 
 ## Results
 
-Apart from the one paragraph that quotes the recorded Wokwi CSVs, the numbers in
+Apart from the one paragraph that quotes the old recorded Wokwi runs ([archived](#archive)), the numbers in
 this section come from the software-in-the-loop harness in [`test/`](test/): the real `sketch.ino` and `chip/chip.chip.c`, unmodified,
 built with the real Adafruit libraries on a simulated clock and I²C bus, with
 per-iteration CPU time measured on a cycle-accurate AVR simulator. What that
@@ -94,7 +94,7 @@ At 359° the body is physically 1° off. The naive controller swings it through
 it 1°. At 181° the two are indistinguishable, because the long way is 181° and
 the short way 179°. A 2° difference is inside the noise.
 
-That is why the recorded Wokwi runs in [`results/`](results/) never showed the
+That is why the old recorded Wokwi runs ([archived](#archive)) never showed the
 effect: they were taken at 181°. Their starting errors, 180.91° and 179.09°,
 are one attitude measured two ways. Over the window both runs cover (to 2.74 s)
 they travel **238.9° naive and 237.4° corrected**, and their different final
@@ -105,7 +105,7 @@ only as a record.
 
 The SIL gets to 359° by starting the plant and the estimator together, as if
 the body had been pushed once round. Wokwi has no hook for that yet. It would
-go in bit 0 (reset) of the blueprint's `0x60` control register, which so far
+go in bit 0 (reset) of the plant's `0x60` control register, which so far
 implements only bit 2 (bias). The naive build is
 `pio run -e unwinding_demo` (`-DUNWINDING_DEMO=1`).
 
@@ -190,7 +190,7 @@ Three things were stacked on top of each other:
    the render and the telemetry, the UI block took longer than its own 33 ms
    timer, so it fired on *every* iteration. The framebuffer now streams two
    31-byte chunks per loop, ~1.5 ms of bus each time. Frames drop to ~10 FPS,
-   which is the blueprint's own target for an artificial horizon.
+   which is plenty for an artificial horizon.
 3. **Telemetry printed floats.** `Serial.print(x, 4)` costs ~9,000 cycles a value
    in soft float, and the line has eight of them. It now formats them as fixed
    point by subtraction: the same text (checked over 20,001 values in
@@ -261,7 +261,7 @@ depending entirely on whether the part has an FPU:
 |---|---|---|
 | **Arduino Mega** (ATmega2560), the Wokwi prototype | none | **wins, slightly:** 730 cycles against 979 for `1.0f/sqrtf` (simavr). That's ~16 µs a loop, 0.3% of the period |
 | **ESP32** (Xtensa LX6) | yes | **should lose.** `1.0f/sqrtf(x)` is a couple of instructions and correctly rounded, and the trick also pays to move between integer and float register files. *Not measured.* |
-| **STM32WBA55** (Cortex-M33F), the custom board | yes | **should lose**, same reason. *Not measured.* |
+| **STM32WBA55** (Cortex-M33F), the archived v1 board | yes | **should lose**, same reason. *Not measured.* |
 
 `sketch.ino` selects on `__AVR__` rather than assuming, and the AVR path
 type-puns through `memcpy`, not `*(long*)&y`, which is a strict-aliasing
@@ -277,60 +277,6 @@ target. That takes ~300 cycles off every loop (40,500 → 40,186 per iteration,
 measured) and makes the normalisation exact.
 
 ---
-
-## The board
-
-![Custom attitude-control board, v1 schematic](docs/schematic.png)
-
-An STM32WBA55HEFx (Cortex-M33 + FPU, integrated radio) on 3V3 from an AMS1117
-LDO, with the joystick on `PA0`/`PA1`, the gain potentiometer on `PA2`, SWD on
-J1, and 4.7 kΩ I²C pull-ups to an off-board IMU on J3.
-
-**v1 is a schematic, and it should not be fabricated as drawn.** The whole
-design is 11 components. Tracing the netlist out of the `.kicad_sch` rather than
-eyeballing the sheet, in severity order:
-
-1. **`VDD11` is tied to +3V3.** Every supply pin — `VDD`, `VDDA`, `VDDANA`,
-   `VDDHPA`, `VDDRF`, `VDDRFPA`, `VDDSMPS` **and `VDD11`** — sits on one net.
-   `VDD11` is the 1.1 V core/radio domain, not a supply input. Driving 3.3 V
-   into it is a part-killer, and it is consistent with the next item: the SMPS
-   that is supposed to *produce* that rail has been no-connected instead.
-2. **`VLXSMPS` is no-connect.** The internal SMPS needs its inductor between
-   `VLXSMPS` and `VDD11`, or the part must be strapped for LDO mode per the
-   datasheet's power-supply scheme. As drawn it is neither, which is how 1
-   happened. **Fix these two together — read the datasheet's supply table and
-   redraw the power section from it.**
-3. **The package is `ST_WLCSP-41_2.98x2.76mm_P0.4mm_Stagger`.** A 41-ball
-   wafer-level chip-scale part on 0.4 mm staggered pitch: bare die, no leads.
-   That needs HDI with via-in-pad and laser microvias, a stencil and reflow, and
-   it cannot be hand-soldered, reworked, or probed. It is also light-sensitive.
-   The QFN version of the same silicon is routable on two layers and solderable
-   with an iron. Unless there is a size constraint that justifies it, **this one
-   choice is what makes the board unbuildable at hobby scale.**
-4. **Decoupling is one capacitor.** `C1` (0.1 µF) and `C2` (10 µF) are the only
-   caps on the sheet, both at the regulator. Eight supply pins want ~100 nF each
-   placed at the ball, plus bulk. On a normal package this is the single most
-   common reason a first article is dead on arrival.
-5. **No crystal.** `OSC_IN`/`OSC_OUT` are no-connect, so this runs on the
-   internal RC — which rules out the radio that is the reason to choose a WBA55.
-   Either add the 32 MHz crystal or drop to a cheaper, non-wireless part.
-6. **`NRST` floats.** It wants the usual 100 nF to ground.
-7. **LDO output cap is light.** The AMS1117 wants ≥10 µF (the datasheet suggests
-   22 µF tantalum) to stay stable; 0.1 µF alone is marginal.
-8. **The project's root sheet is empty.** `hardware/quat_project.kicad_sch` is a
-   blank A4 page, and the real design lives in
-   `quat_project_pcb_v1_sch.kicad_sch`, which nothing references — so opening the
-   project shows nothing. Every symbol's instance path is also still bound to
-   `(project "mini inverter")`, and the title block says the same. The design was
-   started by copying another project and never rebound.
-
-**There is no layout.** `hardware/quat_project.kicad_pcb` is an empty board file
-— no stackup, no footprints, no traces. Footprints *are* assigned to all 11
-symbols, so the netlist would import; nothing has been placed or routed.
-
-➡️ **[`hardware/power-section.md`](hardware/power-section.md)** is the corrected
-wiring to redraw from — both supply modes with the exact pin connections and
-values, the package change, and what to check before ordering.
 
 ## Known limitations
 
@@ -352,14 +298,14 @@ these results would not survive contact with hardware:
 - **Noise is uniform, not Gaussian, and `rand()` is never seeded.** Every run is
   bit-identical. Good for reproducibility, useless for characterising variance.
 - **The MCU Euler-integrates `q` and renormalises.** The plant uses the
-  exponential map; the MCU does not, which contradicts §2.4 of the blueprint. It
-  is standard Mahony formulation, but the discrepancy is unmeasured.
+  exponential map; the MCU does not. That's the standard Mahony formulation, but
+  the difference is unmeasured.
 - **`dt` is unclamped.** A stalled loop feeds an arbitrarily large step into the
   integrator. With the worst period now ~7 ms this only matters if the bus hangs.
   Clamping would be wrong too, because it throws the rotation away.
-- **The recorded CSVs predate the current plant** (a 5 rad/s tumble start; the
-  chip now starts at rest) and were taken at 181°, where unwinding can't show.
-  The SIL results above replace them.
+- **The old recorded Wokwi runs are archived, not reproduced.** They predate the
+  current plant (a 5 rad/s tumble start; the chip now starts at rest) and were
+  taken at 181°, where unwinding can't show. The SIL results above replace them.
 - **Nothing here has run on silicon or been re-run in Wokwi.** The SIL's CPU
   costs are measured, but its bus timing is protocol arithmetic, its ADC is the
   datasheet figure, and its plant is the same chip code Wokwi runs.
@@ -437,13 +383,20 @@ diagram.json      Wokwi wiring
 libraries.txt     Wokwi library manifest
 platformio.ini    local AVR build: `pio run` (and `-e unwinding_demo` for the naive law)
 chip/             custom plant: rigid-body dynamics + simulated IMU
-docs/blueprint.md the full design document — maths, register map, milestones
-docs/schematic.png v1 schematic as drawn — see "The board" before fabricating
-hardware/         KiCad project, plus power-section.md: the corrected wiring to redraw v1 from
-results/          recorded runs and plots
 test/             software-in-the-loop harness and the simavr cycle benchmark
+results/          the unwinding plot above (`make -C test plot` regenerates it)
 ```
 
-`docs/blueprint.md` is the primary reference: it derives the maths, fixes the
-conventions, specifies the I²C register map, and catalogues the traps this
-project hit on the way through.
+## Archive
+
+Past results and versions aren't in the tree, but nothing is lost. The tag
+[`archive-v1`](https://github.com/raahimnawaz/quaternion-attitude-control/tree/archive-v1)
+holds the last full tree:
+
+- `results/`: the recorded 181° Wokwi runs and their plots
+- `docs/blueprint.md`: the original design document, with the register map and the traps the code comments used to cite
+- `hardware/` and `docs/schematic.png`: the v1 STM32WBA55 schematic and its review. Eight netlist defects, never laid out; don't fabricate it as drawn
+
+```bash
+git checkout archive-v1 -- docs hardware results
+```
