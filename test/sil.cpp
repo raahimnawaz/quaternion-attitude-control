@@ -29,6 +29,8 @@ struct Run {
   float w0[3] = {0, 0, 0};
   bool free_spin = false;    // torque payload zeroed on the wire
   int drop_permille = 0;
+  bool inject_bias = false;  // 0x60 bit2, written on the bus after setup()
+  float bias[3] = {0, 0, 0};
   unsigned seed = 1;
   const char *trace = nullptr;  // per-iteration CSV
 };
@@ -41,7 +43,15 @@ struct Result {
   uint32_t iters, frames_done, frame_mismatch, blank_frames;
   uint32_t telemetry_lines, telemetry_bad;
   sim::BusStats bus;
+  // Means over the last TAIL_S of the run. Tilt is the angle between two
+  // "down" directions in the body frame, so it ignores heading.
+  double gyro_offset[3];      // plant gyro minus true rate, whole run
+  double tilt_deg;            // true body vs the level command
+  double est_tilt_deg;        // estimated vs true vertical
+  double yaw_deg;             // true heading at the end (command is 0)
 };
+
+static constexpr double TAIL_S = 5.0;
 
 static double deg(double rad) { return rad * 180.0 / M_PI; }
 
@@ -58,6 +68,18 @@ static double angle_between(const float a[4], const float b[4]) {  // angle of c
   double y = (double)a[0] * b[2] + (double)a[1] * b[3] - (double)a[2] * b[0] - (double)a[3] * b[1];
   double z = (double)a[0] * b[3] - (double)a[1] * b[2] + (double)a[2] * b[1] - (double)a[3] * b[0];
   return angle_of(w, x, y, z);
+}
+
+// Body-frame "down" for q (body to world): the third row of R(q).
+static void down_of(const float q[4], double g[3]) {
+  g[0] = 2.0 * ((double)q[1] * q[3] - (double)q[0] * q[2]);
+  g[1] = 2.0 * ((double)q[0] * q[1] + (double)q[2] * q[3]);
+  g[2] = (double)q[0] * q[0] - (double)q[1] * q[1] - (double)q[2] * q[2] + (double)q[3] * q[3];
+}
+
+static double angle_between_vec(const double a[3], const double b[3]) {
+  const double c[3] = {a[1] * b[2] - a[2] * b[1], a[2] * b[0] - a[0] * b[2], a[0] * b[1] - a[1] * b[0]};
+  return deg(atan2(sqrt(c[0] * c[0] + c[1] * c[1] + c[2] * c[2]), a[0] * b[0] + a[1] * b[1] + a[2] * b[2]));
 }
 
 static void check_telemetry(const std::string &out, Result &res) {
@@ -97,12 +119,20 @@ static Result simulate(const Run &r) {
   memcpy(fw.q_est, q0, sizeof q0);
   sim::drop_permille = r.drop_permille;
   sim::block_torque = r.free_spin;
+  if (r.inject_bias) {
+    plant_set_gyro_bias(sim::plant, r.bias);
+    const uint8_t ctrl[2] = {0x60, 0x04};  // REG_CONTROL, inject bias
+    if (sim::bus_write(sim::IMU_ADDR, ctrl, 2, true)) abort();
+  }
   sim::stats = {};
 
   const uint64_t t0 = sim::now_ns, t1 = t0 + (uint64_t)(r.seconds * 1e9);
   float q_prev[4];
   memcpy(q_prev, q0, sizeof q0);
   std::vector<uint64_t> starts;
+  const uint64_t tail_from = t1 - (uint64_t)(std::min(TAIL_S, r.seconds) * 1e9);
+  uint32_t n_tail = 0;
+  static const double level[3] = {0, 0, 1};
   FILE *trace = r.trace ? fopen(r.trace, "w") : nullptr;
   if (trace) fputs("t_s,err_deg,path_deg,est_err_deg,qw,qx,qy,qz,wx,wy,wz\n", trace);
   while (sim::now_ns < t1) {
@@ -121,11 +151,28 @@ static Result simulate(const Run &r) {
     res.est_err_max_deg = std::max(res.est_err_max_deg, est);
     res.est_err_final_deg = est;
     res.iters++;
+    uint8_t imu[24];
+    float gyro[3];
+    plant_live_imu(sim::plant, imu);
+    memcpy(gyro, imu + 12, sizeof gyro);
+    for (int k = 0; k < 3; k++) res.gyro_offset[k] += gyro[k] - w[k];
+    if (t_iter >= tail_from) {
+      double down_true[3], down_est[3];
+      down_of(q, down_true);
+      down_of(fw.q_est, down_est);
+      res.tilt_deg += angle_between_vec(down_true, level);
+      res.est_tilt_deg += angle_between_vec(down_true, down_est);
+      n_tail++;
+    }
     if (trace)
       fprintf(trace, "%.5f,%.4f,%.4f,%.4f,%.6f,%.6f,%.6f,%.6f,%.5f,%.5f,%.5f\n", (sim::now_ns - t0) / 1e9, err,
               res.path_deg, est, q[0], q[1], q[2], q[3], w[0], w[1], w[2]);
   }
   if (trace) fclose(trace);
+  for (int k = 0; k < 3; k++) res.gyro_offset[k] /= res.iters;
+  res.tilt_deg /= n_tail;
+  res.est_tilt_deg /= n_tail;
+  res.yaw_deg = deg(2.0 * atan2(q_prev[3], q_prev[0]));
 
   std::vector<double> periods;
   for (size_t i = 1; i < starts.size(); i++) periods.push_back((starts[i] - starts[i - 1]) / 1e3);
@@ -286,6 +333,25 @@ static void test_telemetry() {
         res.telemetry_lines, res.telemetry_bad);
 }
 
+// Blueprint M7 step 3. Roll/pitch bias is observable from the accelerometer;
+// yaw bias is not (no magnetometer).
+static constexpr float BIAS[3] = {0.05f, -0.03f, 0.04f};  // rad/s, the chip's default
+
+static void test_bias_injected() {
+  puts("0x60 bit2 adds the injected bias to the plant's gyro");
+  Run r;
+  r.seconds = 30;
+  r.inject_bias = true;
+  memcpy(r.bias, BIAS, sizeof BIAS);
+  Result res = run(r);
+  double worst = 0;
+  for (int k = 0; k < 3; k++) worst = std::max(worst, fabs(res.gyro_offset[k] - BIAS[k]));
+  CHECK(worst < 1e-3, "gyro minus true rate averages [%.4f, %.4f, %.4f] rad/s, injected [%.2f, %.2f, %.2f]",
+        res.gyro_offset[0], res.gyro_offset[1], res.gyro_offset[2], BIAS[0], BIAS[1], BIAS[2]);
+  printf("        (last %.0f s: body tilted %.2f deg, estimated vertical %.2f deg off, heading %.1f deg)\n", TAIL_S,
+         res.tilt_deg, res.est_tilt_deg, res.yaw_deg);
+}
+
 static void report_timing() {
   puts("Loop timing, 5 s, stick deflected (bus is a floor: no TWI ISR time)\n");
   puts("firmware   IMU bus  mean us   p50 us   p99 us   max us   ctrl Hz   OLED FPS  OLED bus  IMU bus");
@@ -335,6 +401,7 @@ int main(int argc, char **argv) {
   test_dropped_reads();
   test_consistent_bursts();
   test_telemetry();
+  test_bias_injected();
   printf("\n%s\n", failures ? "FAILED" : "all passed");
   return failures ? 1 : 0;
 }

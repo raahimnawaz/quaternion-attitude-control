@@ -213,12 +213,12 @@ it's very tempting to "just peek" when debugging.
 | Reg | Dir | Bytes | Meaning | Implemented |
 |---|---|---|---|---|
 | `0x00` | R | 1 | `WHO_AM_I` → `0x51` | yes |
-| `0x10` | R | 12 | gyro x,y,z — float32, body frame, rad/s, **noisy**, zero-mean | yes |
+| `0x10` | R | 12 | gyro x,y,z — float32, body frame, rad/s, **noisy**, plus a constant bias while `0x60` bit2 is set | yes |
 | `0x20` | R | 16 | `q_meas` w,x,y,z — noisy attitude sensor | **no** — superseded at M7 |
 | `0x30` | R | 16 | `q_true` w,x,y,z — **ground truth, scoring only** | yes |
 | `0x40` | R | 12 | `ω_true` x,y,z | yes |
 | `0x50` | W | 12 | torque command x,y,z — float32, N·m | yes |
-| `0x60` | W | 1 | control: bit0 reset, bit1 freeze, bit2 inject bias, bit3 inject dropout | **no** |
+| `0x60` | W | 1 | control: bit0 reset, bit1 freeze, bit2 inject bias, bit3 inject dropout | **bit2 only** |
 | `0x61` | W | 4 | gyro noise σ (float32, rad/s) | **no** — σ fixed at 0.02 |
 | `0x70` | R | 24 | accel x,y,z **then** gyro x,y,z — float32, body frame, **noisy** | yes |
 
@@ -239,12 +239,12 @@ transaction opens and serves every byte from that snapshot. Reading a quaternion
 in one transaction (§6.3) is necessary but not sufficient — the plant also has to
 hold still while you read it.
 
-> **`0x20`, `0x60` and `0x61` are specified here but not built.** They were
-> `#define`d in the v1 chip and never appeared in its read or write handlers, so
-> they have never worked. `0x60` is the gap worth closing first: without it, M7's
-> "inject bias" and "inject dropout" demonstrations cannot be triggered at all,
-> and the gyro model is currently zero-mean noise with **no bias term**, which is
-> why the description at `0x10` no longer claims one.
+> **`0x20`, `0x61` and most of `0x60` are specified here but not built.** They
+> were `#define`d in the v1 chip and never appeared in its read or write
+> handlers. `0x60` bit2 is now built: it adds a constant per-axis bias to the
+> gyro (default `[0.05, −0.03, 0.04]` rad/s, set in `chip_init`). The bias value
+> is ground truth, like `q_true`, so no register serves it. Bits 0, 1 and 3
+> (reset, freeze, dropout) are still ignored.
 
 > **Trap.** Read all four quaternion floats in **one** I²C transaction. Four
 > separate transactions sample four different instants of a plant running at

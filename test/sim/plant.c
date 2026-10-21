@@ -24,6 +24,12 @@ void plant_zero_torque(void *ud) {
   memset(((chip_state_t *)ud)->tau, 0, 12);
 }
 
+// The bias's value. Switching it on is the firmware-visible part and goes
+// through the 0x60 register on the bus.
+void plant_set_gyro_bias(void *ud, const float b[3]) {
+  memcpy(((chip_state_t *)ud)->gyro_bias, b, 12);
+}
+
 void plant_live_imu(void *ud, uint8_t out[24]) {
   chip_state_t *c = (chip_state_t *)ud;
   memcpy(out, c->accel_out, 12);
